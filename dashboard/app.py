@@ -49,14 +49,19 @@ decay = load("ic_decay")
 betas = load("capm_betas")
 opt_weights = load("optimal_weights")
 frontier = load("efficient_frontier")
+ma_weights = load("multiasset_weights")
+ma_frontier = load("multiasset_frontier")
+ma_betas = load("multiasset_betas")
+div_screen = load("dividend_screen")
 
 if screen is None:
     st.warning("No outputs yet. Build them first: `python run.py screen`, "
                "then `backtest` / `decompose`.")
     st.stop()
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["Screen", "Backtest", "Factor decomposition", "Portfolio / CAPM"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["Screen", "Backtest", "Factor decomposition", "Portfolio / CAPM",
+     "Multi-asset", "Dividend income"])
 
 with tab1:
     st.subheader("Ranked screen")
@@ -239,3 +244,68 @@ with tab4:
             tooltip=["ticker", alt.Tooltip("weight:Q", format=".1%")],
         )
         st.altair_chart(weight_chart, use_container_width=True)
+
+with tab5:
+    if ma_weights is None:
+        st.info("No multi-asset output yet — run `python run.py multiasset`.")
+    else:
+        st.subheader("Cross-asset allocation (equity / bond / commodity ETF proxies)")
+        st.caption("Bonds and commodities enter as liquid ETFs, not the equity factor screen — "
+                   "the factor engine (P/E, ROE, GICS z-scores) has no meaning for them, and free "
+                   "per-security data doesn't exist. This is the asset-allocation view.")
+        by_class = ma_weights.groupby("asset_class", as_index=False)["weight"].sum()
+        donut = alt.Chart(by_class).mark_arc(innerRadius=60).encode(
+            theta=alt.Theta("weight:Q"),
+            color=alt.Color("asset_class:N", title="Asset class"),
+            tooltip=["asset_class", alt.Tooltip("weight:Q", format=".1%")],
+        )
+        st.altair_chart(donut, use_container_width=True)
+
+        st.caption("Max-Sharpe weights by ETF:")
+        w = ma_weights[ma_weights["weight"] > 0.005].sort_values("weight", ascending=False)
+        etf_chart = alt.Chart(w).mark_bar().encode(
+            x=alt.X("weight:Q", title="Weight", axis=alt.Axis(format="%")),
+            y=alt.Y("ticker:N", sort="-x", title=None),
+            color=alt.Color("asset_class:N", title="Asset class"),
+            tooltip=["ticker", "asset_class", alt.Tooltip("weight:Q", format=".1%")],
+        )
+        st.altair_chart(etf_chart, use_container_width=True)
+
+        if ma_frontier is not None and len(ma_frontier):
+            st.subheader("Cross-asset efficient frontier")
+            ma_front_chart = alt.Chart(ma_frontier).mark_line(point=True, color="steelblue").encode(
+                x=alt.X("volatility:Q", title="Volatility (annualized)", axis=alt.Axis(format="%")),
+                y=alt.Y("target_return:Q", title="Expected return (annualized)",
+                        axis=alt.Axis(format="%")),
+                tooltip=[alt.Tooltip("volatility:Q", format=".1%"),
+                         alt.Tooltip("target_return:Q", format=".1%")],
+            )
+            st.altair_chart(ma_front_chart, use_container_width=True)
+
+with tab6:
+    if div_screen is None:
+        st.info("No dividend screen yet — run `python run.py dividend`.")
+    else:
+        st.subheader("Dividend-income screen")
+        st.caption("Ranked by trailing-12m dividend yield, gated on payout sustainability "
+                   "(dividends / earnings) — a high yield funded by ~all of earnings is a cut "
+                   "waiting to happen, so those are dropped.")
+        show = div_screen.copy()
+        show["dividend_yield"] = (show["dividend_yield"] * 100).round(2)
+        show["payout_ratio"] = (show["payout_ratio"] * 100).round(0)
+        cols = ["rank", "ticker", "dividend_yield", "payout_ratio", "sector", "weight"]
+        st.dataframe(show[[c for c in cols if c in show.columns]],
+                     use_container_width=True, hide_index=True)
+
+        st.subheader("Yield vs. payout ratio")
+        st.caption("Top-right = high yield but stretched payout (riskier); "
+                   "left = safer coverage. The gate already removed payout > ceiling.")
+        scatter = alt.Chart(div_screen).mark_circle(size=90, opacity=0.7).encode(
+            x=alt.X("payout_ratio:Q", title="Payout ratio", axis=alt.Axis(format="%")),
+            y=alt.Y("dividend_yield:Q", title="Dividend yield", axis=alt.Axis(format="%")),
+            color=alt.Color("sector:N", title="Sector") if "sector" in div_screen.columns
+            else alt.value("#2a9d8f"),
+            tooltip=["ticker", alt.Tooltip("dividend_yield:Q", format=".2%"),
+                     alt.Tooltip("payout_ratio:Q", format=".0%")],
+        )
+        st.altair_chart(scatter, use_container_width=True)

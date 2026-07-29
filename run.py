@@ -9,6 +9,8 @@ Usage (from the repo root):
     python run.py backtest --freq quarterly
     python run.py decompose              # FF5+UMD alpha decomposition
     python run.py optimize               # CAPM betas + mean-variance optimizer over the screen
+    python run.py multiasset             # cross-asset (equity/bond/commodity ETF) allocation
+    python run.py dividend               # dividend-income screen (yield + payout sustainability)
     python run.py export                 # write outputs/*.parquet for the dashboard
 
 Each subcommand loads ``config.yaml``, does its work, and writes results into
@@ -30,7 +32,8 @@ from screener.data.fmp import FMPProvider
 from screener.data.french import get_ff_factors
 from screener.data.yf import YFinanceProvider
 from screener.db import connect, write_table
-from screener.factors import SLEEVES, compute_factors
+from screener.dividend import build_dividend_screen
+from screener.factors import SLEEVES, compute_factors, pit_fundamentals, price_asof
 from screener.normalize import composite, sector_neutral_z
 from screener.optimize import (
     efficient_frontier,
@@ -290,6 +293,91 @@ def cmd_optimize(cfg: Config, con) -> None:
     print(w_sharpe.sort_values(ascending=False).head(5).to_string())
 
 
+def cmd_multiasset(cfg: Config, con) -> None:
+    """Mean-variance / CAPM allocation across asset classes via liquid ETF proxies.
+
+    Equities (SPY), bonds, and commodities enter as ETFs — the equity factor
+    screen doesn't apply to bonds/commodities and free per-security data for them
+    doesn't exist, so this asset-allocation view is where they legitimately live.
+    """
+    ac = cfg.asset_classes
+    tickers = ac.all_tickers()
+    labels = ({ac.equity_proxy: "Equity"}
+              | {t: "Bond" for t in ac.bond_etfs}
+              | {t: "Commodity" for t in ac.commodity_etfs})
+
+    prices = YFinanceProvider(cfg.data.cache_dir).get_prices(
+        tickers, cfg.backtest.start, cfg.backtest.end).dropna(axis=1, how="all")
+    monthly = prices.resample("ME").last()
+    rets = monthly.pct_change().dropna(how="all").dropna(axis=1, thresh=24)
+    if rets.shape[1] < 3:
+        print("Not enough overlapping ETF history to build a multi-asset allocation.")
+        return
+
+    ff = get_ff_factors(start=cfg.backtest.start, end=cfg.backtest.end)
+    ff.index = pd.to_datetime(ff.index).to_period("M").to_timestamp("M")
+    rets.index = pd.to_datetime(rets.index).to_period("M").to_timestamp("M")
+
+    betas = estimate_betas_panel(rets, ff)
+    betas["asset_class"] = betas.index.map(labels)
+    betas.index.name = "ticker"
+    write_table(con, "multiasset_betas", betas.reset_index())
+
+    mean_a, cov_a = rets.mean() * 12, rets.cov() * 12
+    rf_a = float(ff["RF"].reindex(rets.index).mean()) * 12
+    w_sharpe = max_sharpe_weights(mean_a, cov_a, rf=rf_a)
+    stats = portfolio_stats(w_sharpe, mean_a, cov_a, rf=rf_a)
+
+    alloc = pd.DataFrame({"ticker": w_sharpe.index, "weight": w_sharpe.values})
+    alloc["asset_class"] = alloc["ticker"].map(labels)
+    write_table(con, "multiasset_weights", alloc)
+    write_table(con, "multiasset_frontier", efficient_frontier(mean_a, cov_a, n_points=25))
+
+    by_class = alloc.groupby("asset_class")["weight"].sum().sort_values(ascending=False)
+    print(f"Multi-asset max-Sharpe allocation ({rets.shape[1]} ETFs, {len(rets)} months): "
+          f"return={stats['expected_return']:.1%} vol={stats['volatility']:.1%} "
+          f"Sharpe={stats['sharpe']:.2f}")
+    print("By asset class:")
+    print(by_class.to_string())
+
+
+def cmd_dividend(cfg: Config, con, max_names=None) -> None:
+    """Dividend-income screen: trailing yield gated on payout sustainability."""
+    today = pd.Timestamp.today().normalize()
+    start = (today - pd.DateOffset(years=2)).strftime("%Y-%m-%d")
+    uni, fund, prices = _load_universe_and_data(
+        cfg, max_names, start, today.strftime("%Y-%m-%d"))
+    if fund.empty or prices.empty:
+        print("No fundamentals/prices available for the dividend screen.")
+        return
+
+    as_of = prices.index.max()
+    pit = pit_fundamentals(fund, as_of)
+    price = price_asof(prices, as_of)
+    tickers = pit.index.intersection(price.index)
+    divs = YFinanceProvider(cfg.data.cache_dir).get_dividends(list(tickers)).set_index("ticker")
+
+    dividends_ttm = divs["dividends_ttm"].reindex(tickers)
+    shares = pit.loc[tickers, "shares_diluted"]
+    net_income = pit.loc[tickers, "net_income_ttm"]
+    sector = uni.set_index("ticker")["sector"].reindex(tickers)
+
+    screen = build_dividend_screen(
+        dividends_ttm, price.loc[tickers], shares, net_income, sector=sector,
+        min_yield=cfg.dividend.min_yield, max_payout=cfg.dividend.max_payout,
+        top_n=cfg.dividend.top_n)
+    screen.insert(0, "as_of", as_of)
+    write_table(con, "dividend_screen", screen)
+
+    print(f"Dividend screen as of {as_of.date()}: {len(screen)} names "
+          f"(payout <= {cfg.dividend.max_payout:.0%}, ranked by yield)")
+    show = screen.head(15).copy()
+    show["dividend_yield"] = (show["dividend_yield"] * 100).round(2).astype(str) + "%"
+    show["payout_ratio"] = (show["payout_ratio"] * 100).round(0).astype(str) + "%"
+    cols = ["rank", "ticker", "dividend_yield", "payout_ratio", "sector"]
+    print(show[cols].to_string(index=False))
+
+
 def _table_exists(con, name: str) -> bool:
     try:
         con.execute(f'SELECT 1 FROM "{name}" LIMIT 1')
@@ -306,7 +394,8 @@ def cmd_export(cfg: Config, con) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "command", choices=["screen", "backtest", "decompose", "optimize", "export"])
+        "command",
+        choices=["screen", "backtest", "decompose", "optimize", "multiasset", "dividend", "export"])
     parser.add_argument("--freq", choices=["monthly", "quarterly"], default="monthly")
     parser.add_argument("--max-names", type=int, default=None,
                         help="cap universe size (FMP free tier: ~250 calls/day, 4 per name)")
@@ -327,6 +416,10 @@ def main() -> None:
         cmd_decompose(cfg, con)
     elif args.command == "optimize":
         cmd_optimize(cfg, con)
+    elif args.command == "multiasset":
+        cmd_multiasset(cfg, con)
+    elif args.command == "dividend":
+        cmd_dividend(cfg, con, args.max_names)
     elif args.command == "export":
         cmd_export(cfg, con)
 

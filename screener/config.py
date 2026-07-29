@@ -113,6 +113,31 @@ class OutputConfig(BaseModel):
     export_dir: str = "outputs"
 
 
+class AssetClasses(BaseModel):
+    """Cross-asset building blocks for the multi-asset optimizer.
+
+    Bonds and commodities are represented by liquid, free-to-price ETFs — the
+    equity factor engine (P/E, ROE, GICS z-scores) has no meaning for them, and
+    per-security fixed-income/commodity data isn't available free, so they enter
+    the tool only here, as assets in the mean-variance / CAPM allocation.
+    """
+
+    equity_proxy: str = "SPY"
+    bond_etfs: list[str] = Field(default_factory=lambda: ["AGG", "TLT", "IEF", "LQD", "HYG", "TIP"])
+    commodity_etfs: list[str] = Field(
+        default_factory=lambda: ["GLD", "SLV", "USO", "DBC", "DBA", "CPER"]
+    )
+
+    def all_tickers(self) -> list[str]:
+        return [self.equity_proxy, *self.bond_etfs, *self.commodity_etfs]
+
+
+class DividendConfig(BaseModel):
+    min_yield: float = Field(0.0, ge=0.0)          # keep names yielding at least this (decimal)
+    max_payout: float = Field(0.90, gt=0.0)        # sustainability gate: payout ratio ceiling
+    top_n: int = Field(30, gt=0)
+
+
 class Config(BaseModel):
     universe: UniverseConfig
     data: DataConfig
@@ -125,6 +150,8 @@ class Config(BaseModel):
     backtest: BacktestConfig
     costs: CostsConfig
     output: OutputConfig
+    asset_classes: AssetClasses = Field(default_factory=AssetClasses)
+    dividend: DividendConfig = Field(default_factory=DividendConfig)
 
 
 def load_config(path: str | Path = "config.yaml") -> Config:

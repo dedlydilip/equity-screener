@@ -72,3 +72,18 @@ costs:
 output:
   duckdb_path: outputs/screener.duckdb
   export_dir: outputs
+
+# Multi-asset building blocks. Bonds & commodities are liquid ETF proxies (the
+# equity factor engine doesn't apply to them, and free per-security data doesn't
+# exist) — they enter only in the mean-variance / CAPM allocation, not the screen.
+asset_classes:
+  equity_proxy: SPY
+  bond_etfs: [AGG, TLT, IEF, LQD, HYG, TIP]        # aggregate, long/interm. Treasuries, IG, HY, TIPS
+  commodity_etfs: [GLD, SLV, USO, DBC, DBA, CPER]  # gold, silver, oil, broad, agriculture, copper
+
+# Dividend-income screen (yield + sustainability). Yield from trailing-12m
+# dividends; payout ratio from EDGAR net income (already pulled for the factors).
+dividend:
+  min_yield: 0.0
+  max_payout: 0.90       # drop names paying out > 90% of earnings (unsustainable)
+  top_n: 30

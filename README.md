@@ -44,11 +44,15 @@ screener/
   portfolio.py         quantile assignment, equal / market-cap / inverse-vol weighting, concentration
   screen.py           hard filters + the ranked screen
   validate.py         IC, quintile backtest, Sharpe, Max Drawdown, turnover, FF5+UMD decomposition
+  capm.py             per-security CAPM beta / alpha vs. the market (Newey-West)
+  optimize.py         long-only mean-variance: max-Sharpe, min-variance, efficient frontier (SLSQP)
+  dividend.py         dividend-income screen: trailing yield gated on payout sustainability
   db.py, report.py    DuckDB analytical store + parquet export for the dashboards
 sql/                  DuckDB analytical queries (sector exposure, quintile returns, ...)
-dashboard/app.py      Streamlit dashboard (primary) — screen, backtest, factor decomposition
+dashboard/app.py      Streamlit dashboard (primary) — 6 tabs (screen, backtest, decomposition,
+                      portfolio/CAPM, multi-asset, dividend income)
 tests/                pytest suite (fixtures only — no live API calls in CI)
-run.py                CLI: screen | backtest | decompose | export
+run.py                CLI: screen | backtest | decompose | optimize | multiasset | dividend | export
 ```
 
 ## Methodology
@@ -77,6 +81,21 @@ per-rebalance and annualized; net-of-cost returns (5 bps commission + 10 bps spr
 rebate, per side); and the FF5+UMD alpha decomposition described above, with Newey-West
 standard errors.
 
+**Portfolio construction & CAPM:** each screened name gets a CAPM beta and alpha (regressing its
+excess return on the market factor, Newey-West errors), shown on a Security Market Line. A long-only
+mean-variance optimizer then produces the **maximum-Sharpe (tangency)** and **minimum-variance**
+portfolios plus the **efficient frontier** — the tangency portfolio *is* the CAPM market portfolio,
+so the betas and the optimized weights are two views of one model.
+
+**Multi-asset allocation:** the same optimizer runs across asset classes represented by liquid ETFs —
+equities (SPY), bonds (AGG/TLT/IEF/LQD/HYG/TIP), and commodities (GLD/SLV/USO/DBC/DBA/CPER). Bonds and
+commodities have no equity-style fundamentals and no free per-security data, so they enter here as
+ETF proxies, never through the factor screen.
+
+**Dividend income:** a separate screen ranking on trailing-12-month dividend yield but gated on
+**payout sustainability** (dividends / earnings, from the same EDGAR data) — a high yield funded by
+nearly all of earnings is a cut waiting to happen, so those are dropped.
+
 ## Data
 
 Everything runs on **free** sources — no API key required for the default path:
@@ -104,6 +123,9 @@ pip install -e ".[dev]"
 python run.py screen                    # latest ranked screen + concentration diagnostics
 python run.py backtest --freq monthly   # IC, quintile spread, turnover
 python run.py decompose                 # FF5+UMD alpha decomposition of the Q5-Q1 spread
+python run.py optimize                  # CAPM betas + mean-variance portfolio over the screen
+python run.py multiasset                # cross-asset (equity/bond/commodity ETF) allocation
+python run.py dividend                  # dividend-income screen (yield + payout sustainability)
 python run.py export                    # write outputs/*.parquet for the dashboard
 
 streamlit run dashboard/app.py          # browse the results  (pip install -e ".[dashboard]")
@@ -153,11 +175,19 @@ index membership (removes survivorship bias) and inverse-vol sleeve weighting in
   reported fallback percentage, but not eliminated.
 - **Transaction costs are modeled, not simulated** — commission, spread, and short-rebate are
   applied as flat per-side bps, not a market-impact model.
-- **This is a screener and factor-research engine, not a portfolio optimizer** — position sizing
-  is rule-based (equal / market-cap / inverse-vol), not mean-variance optimized.
+- **Mean-variance is estimation-error sensitive** — the optimizer uses plain sample means and
+  covariances, so it produces concentrated, sometimes corner solutions (e.g. the multi-asset run
+  can allocate ~0% to bonds when their sample risk-adjusted return over the window is weak). That is
+  a well-known property of unconstrained Markowitz, not a bug; robust/shrinkage covariance (e.g.
+  Ledoit-Wolf) and per-asset-class weight floors are the natural next step.
+- **Bonds & commodities are ETF proxies, not individual securities** — an asset-allocation view, not
+  security-level fixed-income or commodity analytics (which need paid data feeds). The CAPM betas
+  for them are descriptive.
+- **CAPM betas are single-factor and descriptive** — useful for the SML view and as optimizer inputs,
+  not a standalone trading signal.
 
 ## Author
 
 Built by Dilip Amaranarayana as a portfolio project demonstrating factor-investing methodology,
-point-in-time data discipline, and full-stack analytics engineering (Python, SQL/DuckDB,
-Streamlit/Power BI).
+point-in-time data discipline, portfolio construction (CAPM / mean-variance), and full-stack
+analytics engineering (Python, SQL/DuckDB, Streamlit/Power BI).
