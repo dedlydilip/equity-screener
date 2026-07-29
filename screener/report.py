@@ -8,7 +8,9 @@ from pathlib import Path
 
 from .db import query, query_file
 
-_TABLES = ["universe", "screen", "factor_panel", "backtest_quintiles", "ff_decomposition"]
+_TABLES = [
+    "universe", "screen", "factor_panel", "backtest_quintiles", "ff_decomposition", "ic_decay",
+]
 
 
 def export_for_dashboard(con, export_dir: str = "outputs") -> list[str]:

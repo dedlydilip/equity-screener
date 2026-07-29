@@ -35,7 +35,13 @@ from screener.portfolio import weights as portfolio_weights
 from screener.report import export_for_dashboard
 from screener.screen import build_screen
 from screener.universe import get_sp500
-from screener.validate import ff_decompose, ic_summary, information_coefficient, quintile_returns
+from screener.validate import (
+    ff_decompose,
+    ic_decay,
+    ic_summary,
+    information_coefficient,
+    quintile_returns,
+)
 
 
 def _month_ends(start: str, end: str, freq: str) -> pd.DatetimeIndex:
@@ -73,7 +79,12 @@ def _make_provider(cfg: Config):
 
 
 def _composite_at(fund, prices, uni, cfg: Config, as_of, sleeve_weights: dict[str, float]):
-    """One cross-section: raw factors -> sector-neutral z per sleeve -> composite score."""
+    """One cross-section: raw factors -> sector-neutral z per sleeve -> composite score.
+
+    Returns ``(raw, comp, fallback_pct, z_by_sleeve)`` — the per-sleeve z-scores are
+    kept (not just folded into the composite) so callers can persist factor
+    *attribution*: which sleeve drove a name's rank, not just its final score.
+    """
     raw = compute_factors(fund, prices, as_of, cfg.quality_gates)
     uni_idx = uni.set_index("ticker")
     z_by_sleeve = {}
@@ -85,7 +96,7 @@ def _composite_at(fund, prices, uni, cfg: Config, as_of, sleeve_weights: dict[st
         z_by_sleeve[sleeve] = z
         fallback_pct[sleeve] = pct
     comp = composite(z_by_sleeve, sleeve_weights)
-    return raw, comp, fallback_pct
+    return raw, comp, fallback_pct, z_by_sleeve
 
 
 def cmd_screen(cfg: Config, con, max_names=None, only=None) -> None:
@@ -98,7 +109,7 @@ def cmd_screen(cfg: Config, con, max_names=None, only=None) -> None:
         cfg, max_names, start, today.strftime("%Y-%m-%d"), only)
     as_of = prices.index.max() if not prices.empty else today
     equal_w = {"value": 1 / 3, "quality": 1 / 3, "momentum": 1 / 3}
-    raw, comp, fallback_pct = _composite_at(fund, prices, uni, cfg, as_of, equal_w)
+    raw, comp, fallback_pct, z_by_sleeve = _composite_at(fund, prices, uni, cfg, as_of, equal_w)
 
     screen_df = build_screen(comp, raw, cfg.portfolio.hard_filters,
                               cfg.portfolio.select, cfg.portfolio.top_n)
@@ -109,8 +120,23 @@ def cmd_screen(cfg: Config, con, max_names=None, only=None) -> None:
     out.insert(0, "as_of", as_of)
     write_table(con, "screen", out)
     write_table(con, "universe", uni)
-    write_table(con, "factor_panel", raw.reset_index().rename(columns={"index": "ticker"}).assign(
-        as_of=as_of, composite=comp.reindex(raw.index).values))
+
+    # Attribution: which sleeve drove the rank (z_value/z_quality/z_momentum),
+    # plus decision-driving valuation metrics derived from the raw factor ratios
+    # (P/E, P/B, D/E are the inverse/negation of the "higher = better" factor
+    # columns already computed in factors.py — no new data pulls needed).
+    panel = raw.reset_index().rename(columns={"index": "ticker"})
+    panel["as_of"] = as_of
+    panel["composite"] = comp.reindex(raw.index).values
+    for sleeve, z in z_by_sleeve.items():
+        panel[f"z_{sleeve}"] = z.reindex(raw.index).values
+    # raw is still indexed by ticker but panel has been reset to a plain range
+    # index, so these must be assigned by position (.values), not by label —
+    # otherwise pandas aligns on index and every value silently becomes NaN.
+    panel["pe"] = ((1.0 / raw["ep"]).where(raw["ep"] > 0)).values
+    panel["pb"] = ((1.0 / raw["bp"]).where(raw["bp"] > 0)).values
+    panel["debt_to_equity"] = (-raw["de_inv"]).values
+    write_table(con, "factor_panel", panel)
 
     print(f"Screen as of {as_of.date()}: {len(screen_df)} names")
     print(screen_df.head(15).to_string())
@@ -130,7 +156,7 @@ def cmd_backtest(cfg: Config, con, freq: str, max_names=None) -> None:
     equal_w = {"value": 1 / 3, "quality": 1 / 3, "momentum": 1 / 3}
     scores, fwd_returns = {}, {}
     for i, dt in enumerate(dates[:-1]):
-        _, comp, _ = _composite_at(fund, prices, uni, cfg, dt, equal_w)
+        _, comp, _, _ = _composite_at(fund, prices, uni, cfg, dt, equal_w)
         scores[dt] = comp
         px_now = prices[prices.index <= dt].iloc[-1] if (prices.index <= dt).any() else None
         nxt = dates[i + 1]
@@ -142,6 +168,7 @@ def cmd_backtest(cfg: Config, con, freq: str, max_names=None) -> None:
     fwd_df = pd.DataFrame(fwd_returns).T.reindex(scores_df.index)
 
     ic = information_coefficient(scores_df, fwd_df)
+    ic_stats = ic_summary(ic)
     qr = quintile_returns(scores_df, fwd_df, cfg.portfolio.n_quantiles)
 
     long_rows = []
@@ -152,8 +179,16 @@ def cmd_backtest(cfg: Config, con, freq: str, max_names=None) -> None:
                 long_rows.append({"date": dt, "quantile": q, "ret": row[col]})
     write_table(con, "backtest_quintiles", pd.DataFrame(long_rows))
 
+    # IC decay: how fast the signal's predictive power fades at longer horizons
+    # (lag 0 = same-period IC already computed above; reused as the curve's start).
+    decay = ic_decay(scores_df, fwd_df, lags=(1, 3, 5))
+    decay_rows = [{"lag": 0, "ic": ic_stats["mean_ic"]}]
+    decay_rows += [{"lag": int(k.split("_")[1]), "ic": v} for k, v in decay.items()]
+    write_table(con, "ic_decay", pd.DataFrame(decay_rows).sort_values("lag"))
+
     print(f"Backtest ({freq}): {len(scores_df)} rebalances")
-    print(f"IC summary: {ic_summary(ic)}")
+    print(f"IC summary: {ic_stats}")
+    print(f"IC decay: {decay}")
     if "spread" in qr:
         print(f"Q5-Q1 mean: {qr['spread'].mean():.4f}  (n={qr['spread'].notna().sum()})")
 
