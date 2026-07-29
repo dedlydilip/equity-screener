@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Secrets / local
+.env
+.cache/
+
+# Generated outputs (DB + large exports); keep committed result images elsewhere
+outputs/*.duckdb
+outputs/*.parquet
+outputs/*.csv
+
+# Local AI build-state / resume doc (keep private)
+CLAUDE.md

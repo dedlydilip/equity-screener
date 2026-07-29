@@ -1,0 +1,221 @@
+#!/usr/bin/env python
+"""CLI orchestration: universe -> data -> factors -> normalize -> composite ->
+screen -> quintile backtest -> validate -> DuckDB -> dashboard export.
+
+Usage (from the repo root):
+
+    python run.py screen                 # latest ranked screen
+    python run.py backtest --freq monthly
+    python run.py backtest --freq quarterly
+    python run.py decompose              # FF5+UMD alpha decomposition
+    python run.py export                 # write outputs/*.parquet for the dashboard
+
+Each subcommand loads ``config.yaml``, does its work, and writes results into
+the DuckDB store at ``output.duckdb_path`` (config-driven, default
+``outputs/screener.duckdb``) so the dashboards and SQL layer can read them.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+
+import pandas as pd
+
+from screener.config import Config, load_config
+from screener.data.fmp import FMPProvider
+from screener.data.french import get_ff_factors
+from screener.data.yf import YFinanceProvider
+from screener.db import connect, write_table
+from screener.factors import SLEEVES, compute_factors
+from screener.normalize import composite, sector_neutral_z
+from screener.portfolio import concentration
+from screener.portfolio import weights as portfolio_weights
+from screener.report import export_for_dashboard
+from screener.screen import build_screen
+from screener.universe import get_sp500
+from screener.validate import ff_decompose, ic_summary, information_coefficient, quintile_returns
+
+
+def _month_ends(start: str, end: str, freq: str) -> pd.DatetimeIndex:
+    rule = "ME" if freq == "monthly" else "QE"
+    return pd.date_range(start, end, freq=rule)
+
+
+def _load_universe_and_data(cfg: Config, max_names=None, start=None, end=None, only=None):
+    start = start or cfg.backtest.start
+    end = end or cfg.backtest.end
+    uni = get_sp500()
+    if only:  # explicit ticker subset (FMP free tier only serves fundamentals for some names)
+        uni = uni[uni["ticker"].isin(only)].reset_index(drop=True)
+    if max_names:
+        uni = uni.head(max_names)  # bound the universe to stay under FMP free-tier daily call cap
+    tickers = uni["ticker"].tolist()
+    provider = FMPProvider(api_key_env=cfg.data.fmp_api_key_env, cache_dir=cfg.data.cache_dir)
+    try:
+        fund = provider.get_fundamentals(tickers)
+        prices = provider.get_prices(tickers, start, end)
+    except RuntimeError as e:
+        print(f"[run.py] FMP unavailable ({e}); falling back to yfinance for prices "
+              f"(fundamentals require FMP for point-in-time correctness).", file=sys.stderr)
+        prices = YFinanceProvider().get_prices(tickers, start, end)
+        fund = pd.DataFrame(columns=["ticker", "period_end", "filing_date"])
+    return uni, fund, prices
+
+
+def _composite_at(fund, prices, uni, cfg: Config, as_of, sleeve_weights: dict[str, float]):
+    """One cross-section: raw factors -> sector-neutral z per sleeve -> composite score."""
+    raw = compute_factors(fund, prices, as_of, cfg.quality_gates)
+    uni_idx = uni.set_index("ticker")
+    z_by_sleeve = {}
+    fallback_pct = {}
+    for sleeve, cols in SLEEVES.items():
+        sleeve_vals = raw[cols].mean(axis=1, skipna=True)  # equal-weight within the sleeve
+        hierarchy = [h.model_dump() for h in cfg.normalization.hierarchy]
+        z, pct = sector_neutral_z(sleeve_vals, uni_idx, hierarchy, cfg.normalization.clip)
+        z_by_sleeve[sleeve] = z
+        fallback_pct[sleeve] = pct
+    comp = composite(z_by_sleeve, sleeve_weights)
+    return raw, comp, fallback_pct
+
+
+def cmd_screen(cfg: Config, con, max_names=None, only=None) -> None:
+    # A screen is "as of now", so use a recent price window (covers 12-1 momentum).
+    # FMP's free tier only serves the latest ~5 quarters of fundamentals, so a screen
+    # dated in the config's historical backtest range would be gated out entirely.
+    today = pd.Timestamp.today().normalize()
+    start = (today - pd.DateOffset(years=2)).strftime("%Y-%m-%d")
+    uni, fund, prices = _load_universe_and_data(
+        cfg, max_names, start, today.strftime("%Y-%m-%d"), only)
+    as_of = prices.index.max() if not prices.empty else today
+    equal_w = {"value": 1 / 3, "quality": 1 / 3, "momentum": 1 / 3}
+    raw, comp, fallback_pct = _composite_at(fund, prices, uni, cfg, as_of, equal_w)
+
+    screen_df = build_screen(comp, raw, cfg.portfolio.hard_filters,
+                              cfg.portfolio.select, cfg.portfolio.top_n)
+    w = portfolio_weights(screen_df.index, cfg.portfolio.weighting, market_cap=raw["market_cap"])
+    conc = concentration(w)
+
+    out = screen_df.reset_index().rename(columns={"index": "ticker"})
+    out.insert(0, "as_of", as_of)
+    write_table(con, "screen", out)
+    write_table(con, "universe", uni)
+    write_table(con, "factor_panel", raw.reset_index().rename(columns={"index": "ticker"}).assign(
+        as_of=as_of, composite=comp.reindex(raw.index).values))
+
+    print(f"Screen as of {as_of.date()}: {len(screen_df)} names")
+    print(screen_df.head(15).to_string())
+    print(f"\nNormalization fallback %: {fallback_pct}")
+    print(f"Concentration: HHI={conc['hhi']:.3f}  top10%={conc['top_10pct_weight']:.1%}  "
+          f"effective_n={conc['effective_n']:.1f}")
+
+
+def cmd_backtest(cfg: Config, con, freq: str, max_names=None) -> None:
+    uni, fund, prices = _load_universe_and_data(cfg, max_names)
+    dates = _month_ends(cfg.backtest.start, cfg.backtest.end, freq)
+    dates = [d for d in dates if d <= prices.index.max()] if not prices.empty else []
+    if len(dates) < 3:
+        print("Not enough price history for a backtest yet (need >= 3 rebalance dates).")
+        return
+
+    equal_w = {"value": 1 / 3, "quality": 1 / 3, "momentum": 1 / 3}
+    scores, fwd_returns = {}, {}
+    for i, dt in enumerate(dates[:-1]):
+        _, comp, _ = _composite_at(fund, prices, uni, cfg, dt, equal_w)
+        scores[dt] = comp
+        px_now = prices[prices.index <= dt].iloc[-1] if (prices.index <= dt).any() else None
+        nxt = dates[i + 1]
+        px_next = prices[prices.index <= nxt].iloc[-1] if (prices.index <= nxt).any() else None
+        if px_now is not None and px_next is not None:
+            fwd_returns[dt] = (px_next / px_now - 1.0)
+
+    scores_df = pd.DataFrame(scores).T
+    fwd_df = pd.DataFrame(fwd_returns).T.reindex(scores_df.index)
+
+    ic = information_coefficient(scores_df, fwd_df)
+    qr = quintile_returns(scores_df, fwd_df, cfg.portfolio.n_quantiles)
+
+    long_rows = []
+    for dt, row in qr.iterrows():
+        for q in range(1, cfg.portfolio.n_quantiles + 1):
+            col = f"Q{q}"
+            if col in row and pd.notna(row[col]):
+                long_rows.append({"date": dt, "quantile": q, "ret": row[col]})
+    write_table(con, "backtest_quintiles", pd.DataFrame(long_rows))
+
+    print(f"Backtest ({freq}): {len(scores_df)} rebalances")
+    print(f"IC summary: {ic_summary(ic)}")
+    if "spread" in qr:
+        print(f"Q5-Q1 mean: {qr['spread'].mean():.4f}  (n={qr['spread'].notna().sum()})")
+
+
+def cmd_decompose(cfg: Config, con) -> None:
+    bt = None
+    if _table_exists(con, "backtest_quintiles"):
+        bt = con.execute('SELECT * FROM "backtest_quintiles"').df()
+    if bt is None or bt.empty:
+        print("Run `python run.py backtest` first — no backtest_quintiles table found.")
+        return
+    piv = bt.pivot_table(index="date", columns="quantile", values="ret")
+    spread = piv[piv.columns.max()] - piv[piv.columns.min()]
+    spread.index = pd.to_datetime(spread.index)
+
+    ff = get_ff_factors(start=cfg.backtest.start, end=cfg.backtest.end)
+    ff.index = pd.to_datetime(ff.index).to_period("M").to_timestamp("M")
+    spread.index = spread.index.to_period("M").to_timestamp("M")
+
+    result = ff_decompose(spread, ff, is_long_short=True)
+    rows = [{"metric": "alpha_monthly", "value": result["alpha_monthly"]},
+            {"metric": "alpha_annualized", "value": result["alpha_annualized"]},
+            {"metric": "alpha_t_nw", "value": result["alpha_t_nw"]},
+            {"metric": "r_squared", "value": result["r_squared"]},
+            {"metric": "n", "value": result["n"]}]
+    rows += [{"metric": f"{k}_loading", "value": v} for k, v in result["loadings"].items()]
+    write_table(con, "ff_decomposition", pd.DataFrame(rows))
+    print(f"FF5+UMD decomposition of Q5-Q1 (n={result['n']}):")
+    print(f"  alpha (annualized) = {result['alpha_annualized']:.4f}  "
+          f"(NW t = {result['alpha_t_nw']:.2f})")
+    print(f"  R^2 = {result['r_squared']:.3f}")
+    print(f"  loadings: {result['loadings']}")
+
+
+def _table_exists(con, name: str) -> bool:
+    try:
+        con.execute(f'SELECT 1 FROM "{name}" LIMIT 1')
+        return True
+    except Exception:
+        return False
+
+
+def cmd_export(cfg: Config, con) -> None:
+    written = export_for_dashboard(con, cfg.output.export_dir)
+    print(f"Exported {len(written)} tables to {cfg.output.export_dir}/: {written}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=["screen", "backtest", "decompose", "export"])
+    parser.add_argument("--freq", choices=["monthly", "quarterly"], default="monthly")
+    parser.add_argument("--max-names", type=int, default=None,
+                        help="cap universe size (FMP free tier: ~250 calls/day, 4 per name)")
+    parser.add_argument("--tickers", default=None,
+                        help="comma-separated ticker subset (e.g. accessible FMP-free names)")
+    parser.add_argument("--config", default="config.yaml")
+    args = parser.parse_args()
+
+    only = [t.strip().upper() for t in args.tickers.split(",")] if args.tickers else None
+    cfg = load_config(args.config)
+    con = connect(cfg.output.duckdb_path)
+
+    if args.command == "screen":
+        cmd_screen(cfg, con, args.max_names, only)
+    elif args.command == "backtest":
+        cmd_backtest(cfg, con, args.freq, args.max_names)
+    elif args.command == "decompose":
+        cmd_decompose(cfg, con)
+    elif args.command == "export":
+        cmd_export(cfg, con)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,73 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Institutional equity screener — pre-registered configuration.
+# Every modelling choice lives here so runs are reproducible and auditable.
+# Validated on load by screener/config.py (Pydantic): e.g. sleeve weights MUST
+# sum to 1.0 and the normalization hierarchy MUST end at cross_sectional.
+# ─────────────────────────────────────────────────────────────────────────────
+
+universe:
+  name: sp500
+  source: wikipedia          # wikipedia (no key) | fmp
+
+data:
+  provider: fmp              # fmp (PiT fundamentals) | yfinance (no key, thinner)
+  fmp_api_key_env: FMP_API_KEY
+  cache_dir: .cache
+  fundamentals_pit: true     # gate fundamentals by SEC fillingDate/acceptedDate
+
+# Raw factor line-items per sleeve (weights within a sleeve; normalized internally)
+factors:
+  value:      { ep: 1.0, bp: 1.0, fcf_yield: 1.0, ev_ebitda_inv: 1.0 }
+  quality:    { roe: 1.0, roic: 1.0, gross_profitability: 1.0, de_inv: 1.0 }
+  momentum:   { ret_12_1: 1.0 }
+
+# Composite sleeve weights — MUST sum to 1.0 (Pydantic-validated)
+sleeve_weights:
+  value: 0.3333
+  quality: 0.3333
+  momentum: 0.3334
+
+weighting:
+  method: inverse_vol        # inverse_vol | equal | custom
+  vol_lookback_months: 12    # trailing window for each sleeve's return vol
+  burn_in_months: 12         # equal-weight until a full trailing window exists (no look-ahead)
+  max_sleeve_weight: 0.50    # cap a sleeve; redistribute excess proportionally
+
+normalization:
+  method: mad                # robust z = (x - median) / (1.4826 * MAD)
+  clip: 5.0                  # clip at +/- 5 MAD
+  hierarchy:                 # finest-first; roll UP to broader (larger-n) groups
+    - { level: industry_group, min_n: 20 }
+    - { level: sector,         min_n: 20 }
+    - { level: cross_sectional }
+
+quality_gates:
+  pe_bounds: [0.0, 500.0]
+  de_min: 0.0
+  xs_mad_flag: 10.0          # flag/winsorize values > 10 MAD from cross-sectional median
+  drop_negative_book_bp: true      # negative book value -> drop from B/P
+  drop_negative_ebitda_ev: true    # negative EBITDA -> NaN EV/EBITDA (no "cheap" distress)
+
+portfolio:
+  weighting: equal           # equal | market_cap | inverse_vol
+  n_quantiles: 5
+  select: top_decile         # top_decile | top_n
+  top_n: 50
+  hard_filters:
+    min_market_cap: 1.0e9
+    positive_earnings: true
+
+backtest:
+  start: "2015-01-01"
+  end: "2024-12-31"
+  rebalance: monthly
+  frequencies_to_test: [monthly, quarterly]
+
+costs:
+  commission_bps: 5.0        # per side
+  spread_bps: 10.0           # per side (large-cap S&P 500)
+  short_rebate_bps: 25.0     # long-short only
+
+output:
+  duckdb_path: outputs/screener.duckdb
+  export_dir: outputs
