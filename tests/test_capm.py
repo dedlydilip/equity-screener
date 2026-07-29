@@ -28,6 +28,9 @@ def test_recovers_known_beta_and_alpha(ff_panel):
     assert result["alpha_monthly"] == pytest.approx(true_alpha, abs=0.003)
     assert result["r_squared"] > 0.7
     assert result["n"] == 72
+    # SML inputs: mean excess return ~= alpha + beta * market excess return (OLS identity).
+    implied = result["alpha_annualized"] + result["beta"] * result["mkt_excess_return_annualized"]
+    assert result["mean_excess_return_annualized"] == pytest.approx(implied, abs=1e-6)
 
 
 def test_defensive_market_has_beta_below_one(ff_panel):

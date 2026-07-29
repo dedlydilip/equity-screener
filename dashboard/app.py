@@ -46,13 +46,17 @@ ffd = load("ff_decomposition")
 uni = load("universe")
 panel = load("factor_panel")
 decay = load("ic_decay")
+betas = load("capm_betas")
+opt_weights = load("optimal_weights")
+frontier = load("efficient_frontier")
 
 if screen is None:
     st.warning("No outputs yet. Build them first: `python run.py screen`, "
                "then `backtest` / `decompose`.")
     st.stop()
 
-tab1, tab2, tab3 = st.tabs(["Screen", "Backtest", "Factor decomposition"])
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["Screen", "Backtest", "Factor decomposition", "Portfolio / CAPM"])
 
 with tab1:
     st.subheader("Ranked screen")
@@ -176,3 +180,62 @@ with tab3:
         st.subheader("Fama-French 5 + Momentum decomposition (Q5−Q1 spread, self-financing)")
         st.dataframe(ffd, use_container_width=True, hide_index=True)
         st.caption("Positive alpha after FF5 + UMD ⇒ a premium not explained by the known factors.")
+
+with tab4:
+    if betas is None or opt_weights is None:
+        st.info("No optimizer output yet — run `python run.py optimize` "
+                "(needs `python run.py screen` first).")
+    else:
+        st.subheader("Security Market Line")
+        st.caption("Each screened name's beta vs. its realized mean excess return. The line is "
+                   "the CAPM prediction (E[R]−Rf = β × market premium); points above it earned "
+                   "more than their systematic risk alone would predict (positive alpha).")
+        b = betas.dropna(subset=["beta", "mean_excess_return_annualized"])
+        if len(b):
+            mkt_premium = float(b["mkt_excess_return_annualized"].iloc[0])
+            beta_range = pd.DataFrame({
+                "beta": [b["beta"].min(), b["beta"].max()],
+            })
+            beta_range["sml"] = beta_range["beta"] * mkt_premium
+            points = alt.Chart(b).mark_circle(size=80, opacity=0.7).encode(
+                x=alt.X("beta:Q", title="Beta"),
+                y=alt.Y("mean_excess_return_annualized:Q", title="Mean excess return (annualized)",
+                        axis=alt.Axis(format="%")),
+                color=alt.Color("alpha_annualized:Q", title="Alpha",
+                                 scale=alt.Scale(scheme="redblue", domainMid=0)),
+                tooltip=["ticker", alt.Tooltip("beta:Q", format=".2f"),
+                         alt.Tooltip("mean_excess_return_annualized:Q", format=".1%"),
+                         alt.Tooltip("alpha_annualized:Q", format=".1%", title="alpha")],
+            )
+            line = alt.Chart(beta_range).mark_line(color="gray", strokeDash=[4, 4]).encode(
+                x="beta:Q", y="sml:Q",
+            )
+            st.altair_chart(points + line, use_container_width=True)
+            st.caption(f"Average beta = {b['beta'].mean():.2f}. Market risk premium used for the "
+                      f"line = {mkt_premium:.1%}/yr (from the Ken French library, same window).")
+
+        st.subheader("Efficient frontier")
+        if frontier is not None and len(frontier) and len(opt_weights):
+            frontier_chart = alt.Chart(frontier).mark_line(point=True, color="steelblue").encode(
+                x=alt.X("volatility:Q", title="Volatility (annualized)", axis=alt.Axis(format="%")),
+                y=alt.Y("target_return:Q", title="Expected return (annualized)",
+                        axis=alt.Axis(format="%")),
+                tooltip=[alt.Tooltip("volatility:Q", format=".1%"),
+                         alt.Tooltip("target_return:Q", format=".1%")],
+            )
+            st.altair_chart(frontier_chart, use_container_width=True)
+            st.caption("Long-only minimum-variance frontier over the screened names (estimation-"
+                      "error sensitive — small-sample means/covariances, not a forecast).")
+
+        st.subheader("Optimal portfolio weights")
+        method = st.radio("Method", ["max_sharpe", "min_variance"], horizontal=True,
+                          format_func=lambda m: "Max Sharpe (CAPM market portfolio)"
+                          if m == "max_sharpe" else "Minimum variance")
+        w = opt_weights[opt_weights["method"] == method].sort_values("weight", ascending=False)
+        w = w[w["weight"] > 0.005]  # hide near-zero long-only weights for readability
+        weight_chart = alt.Chart(w).mark_bar().encode(
+            x=alt.X("weight:Q", title="Weight", axis=alt.Axis(format="%")),
+            y=alt.Y("ticker:N", sort="-x", title=None),
+            tooltip=["ticker", alt.Tooltip("weight:Q", format=".1%")],
+        )
+        st.altair_chart(weight_chart, use_container_width=True)

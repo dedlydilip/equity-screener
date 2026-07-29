@@ -23,7 +23,8 @@ except Exception:  # pragma: no cover
     sm = None
 
 _EMPTY = {"beta": np.nan, "alpha_monthly": np.nan, "alpha_annualized": np.nan,
-          "alpha_t_nw": np.nan, "r_squared": np.nan, "n": 0}
+          "alpha_t_nw": np.nan, "r_squared": np.nan, "n": 0,
+          "mean_excess_return_annualized": np.nan, "mkt_excess_return_annualized": np.nan}
 
 
 def estimate_beta_alpha(returns: pd.Series, ff: pd.DataFrame, nw_lags: int = 6) -> dict:
@@ -31,6 +32,11 @@ def estimate_beta_alpha(returns: pd.Series, ff: pd.DataFrame, nw_lags: int = 6) 
 
     ``ff`` must have ``Mkt_RF`` and ``RF`` columns (as returned by
     ``data.french.get_ff_factors``), indexed on the same dates as ``returns``.
+
+    Also reports the security's own realized mean excess return and the
+    market's mean excess return (both annualized) alongside beta/alpha — the
+    three numbers a Security Market Line needs (x=beta, y=mean excess return,
+    reference line y = beta * market excess return), with no extra data pull.
     """
     if sm is None:
         raise RuntimeError("statsmodels is required for CAPM estimation")
@@ -47,6 +53,8 @@ def estimate_beta_alpha(returns: pd.Series, ff: pd.DataFrame, nw_lags: int = 6) 
         "alpha_t_nw": float(res.tvalues["const"]),
         "r_squared": float(res.rsquared),
         "n": int(res.nobs),
+        "mean_excess_return_annualized": float(y.mean() * 12),
+        "mkt_excess_return_annualized": float(df["Mkt_RF"].mean() * 12),
     }
 
 

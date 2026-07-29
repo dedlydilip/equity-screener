@@ -8,6 +8,7 @@ Usage (from the repo root):
     python run.py backtest --freq monthly
     python run.py backtest --freq quarterly
     python run.py decompose              # FF5+UMD alpha decomposition
+    python run.py optimize               # CAPM betas + mean-variance optimizer over the screen
     python run.py export                 # write outputs/*.parquet for the dashboard
 
 Each subcommand loads ``config.yaml``, does its work, and writes results into
@@ -22,6 +23,7 @@ import sys
 
 import pandas as pd
 
+from screener.capm import estimate_betas_panel
 from screener.config import Config, load_config
 from screener.data.edgar import EdgarProvider
 from screener.data.fmp import FMPProvider
@@ -30,6 +32,12 @@ from screener.data.yf import YFinanceProvider
 from screener.db import connect, write_table
 from screener.factors import SLEEVES, compute_factors
 from screener.normalize import composite, sector_neutral_z
+from screener.optimize import (
+    efficient_frontier,
+    max_sharpe_weights,
+    min_variance_weights,
+    portfolio_stats,
+)
 from screener.portfolio import concentration
 from screener.portfolio import weights as portfolio_weights
 from screener.report import export_for_dashboard
@@ -223,6 +231,65 @@ def cmd_decompose(cfg: Config, con) -> None:
     print(f"  loadings: {result['loadings']}")
 
 
+def cmd_optimize(cfg: Config, con) -> None:
+    """CAPM betas + a long-only mean-variance optimizer over the screened names.
+
+    The max-Sharpe (tangency) portfolio here IS the CAPM "market portfolio" —
+    the theory's efficient-frontier tangency point — so the betas and the
+    optimized weights are two views of one model, not two separate features.
+    """
+    if not _table_exists(con, "screen"):
+        print("Run `python run.py screen` first — no screen table found.")
+        return
+    tickers = con.execute('SELECT ticker FROM "screen"').df()["ticker"].tolist()
+    if len(tickers) < 3:
+        print("Need at least 3 screened names to optimize a portfolio.")
+        return
+
+    provider = _make_provider(cfg)
+    prices = provider.get_prices(tickers, cfg.backtest.start, cfg.backtest.end)
+    prices = prices.dropna(axis=1, how="all")
+    monthly = prices.resample("ME").last()
+    rets = monthly.pct_change().dropna(how="all")
+    rets = rets.dropna(axis=1, thresh=24)  # need enough history for a stable covariance estimate
+    if rets.shape[1] < 3:
+        print("Not enough overlapping price history across screened names to optimize.")
+        return
+
+    ff = get_ff_factors(start=cfg.backtest.start, end=cfg.backtest.end)
+    ff.index = pd.to_datetime(ff.index).to_period("M").to_timestamp("M")
+    rets.index = pd.to_datetime(rets.index).to_period("M").to_timestamp("M")
+
+    betas = estimate_betas_panel(rets, ff)
+    betas.index.name = "ticker"
+    write_table(con, "capm_betas", betas.reset_index())
+
+    mean_a, cov_a = rets.mean() * 12, rets.cov() * 12  # annualize monthly mean/cov
+    rf_a = float(ff["RF"].reindex(rets.index).mean()) * 12
+
+    w_sharpe = max_sharpe_weights(mean_a, cov_a, rf=rf_a)
+    w_minvar = min_variance_weights(cov_a)
+    stats_sharpe = portfolio_stats(w_sharpe, mean_a, cov_a, rf=rf_a)
+    stats_minvar = portfolio_stats(w_minvar, mean_a, cov_a, rf=rf_a)
+
+    weight_rows = (
+        [{"method": "max_sharpe", "ticker": t, "weight": w} for t, w in w_sharpe.items()]
+        + [{"method": "min_variance", "ticker": t, "weight": w} for t, w in w_minvar.items()]
+    )
+    write_table(con, "optimal_weights", pd.DataFrame(weight_rows))
+    write_table(con, "efficient_frontier", efficient_frontier(mean_a, cov_a, n_points=25))
+
+    print(f"CAPM: {rets.shape[1]} names, {len(rets)} months. "
+          f"Average beta = {betas['beta'].mean():.2f} "
+          f"(a broad, diversified basket should sit near 1.0).")
+    print(f"Max-Sharpe portfolio: return={stats_sharpe['expected_return']:.1%} "
+          f"vol={stats_sharpe['volatility']:.1%} Sharpe={stats_sharpe['sharpe']:.2f}")
+    print(f"Min-variance portfolio: return={stats_minvar['expected_return']:.1%} "
+          f"vol={stats_minvar['volatility']:.1%} Sharpe={stats_minvar['sharpe']:.2f}")
+    print("Top max-Sharpe weights:")
+    print(w_sharpe.sort_values(ascending=False).head(5).to_string())
+
+
 def _table_exists(con, name: str) -> bool:
     try:
         con.execute(f'SELECT 1 FROM "{name}" LIMIT 1')
@@ -238,7 +305,8 @@ def cmd_export(cfg: Config, con) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["screen", "backtest", "decompose", "export"])
+    parser.add_argument(
+        "command", choices=["screen", "backtest", "decompose", "optimize", "export"])
     parser.add_argument("--freq", choices=["monthly", "quarterly"], default="monthly")
     parser.add_argument("--max-names", type=int, default=None,
                         help="cap universe size (FMP free tier: ~250 calls/day, 4 per name)")
@@ -257,6 +325,8 @@ def main() -> None:
         cmd_backtest(cfg, con, args.freq, args.max_names)
     elif args.command == "decompose":
         cmd_decompose(cfg, con)
+    elif args.command == "optimize":
+        cmd_optimize(cfg, con)
     elif args.command == "export":
         cmd_export(cfg, con)
 
