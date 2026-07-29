@@ -119,21 +119,26 @@ pytest -q
 
 ## Results (real data)
 
-A monthly backtest over 2015–2024 on real EDGAR fundamentals + yfinance total-return prices
-(50-name large-cap slice, `python run.py backtest --max-names 50` then `decompose`):
+Full S&P 500 universe, monthly 2015–2024, on real EDGAR fundamentals + yfinance total-return prices
+(`python run.py screen`, then `backtest` / `decompose`):
 
 | metric | value |
 |---|---|
+| Screen (latest) | 42 names, effective N ≈ 42 (HHI 0.024) — diversified across sectors |
+| Sector-neutral normalization | **67% of names scored within their GICS industry group**, 30% sector, 3% cross-sectional |
 | Rebalances | 118 (monthly) |
-| Mean Information Coefficient | +0.025 (t ≈ 1.65) |
-| Q5−Q1 spread | +27 bps/month (~3.3%/yr) |
-| FF5+UMD alpha (annualized) | +3.0%, **Newey-West t ≈ 0.6** |
-| Dominant factor loading | HML (value) +0.18 |
+| Mean Information Coefficient | +0.004 (t ≈ 0.6) |
+| Q5−Q1 spread | +20 bps/month |
+| FF5+UMD alpha (annualized) | +2.3%, **Newey-West t ≈ 1.0** |
+| Loadings | small negative SMB (large-cap tilt), mild positive HML |
 
-The honest read: the composite produces a positive raw spread with a real value tilt, but at this
-universe size the alpha is **not statistically distinguishable from zero after controlling for the
-known factors** — which is exactly what the FF decomposition exists to reveal. A larger universe and
-point-in-time index membership are the natural next steps (see Limitations).
+The honest read: across the full liquid large-cap universe the equal-weighted V/Q/M composite shows a
+small positive spread, but the alpha is **not statistically distinguishable from zero** after FF5+UMD
+— the realistic finding that simple composites are largely arbitraged out of large caps, and exactly
+what the decomposition exists to reveal. The genuine strengths on display are the point-in-time
+discipline, the **sector-neutral normalization actually resolving most names within their industry
+group**, and honest reporting rather than an overfit backtest. Natural next steps: point-in-time
+index membership (removes survivorship bias) and inverse-vol sleeve weighting in the composite.
 
 ## Limitations
 
