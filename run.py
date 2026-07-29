@@ -23,6 +23,7 @@ import sys
 import pandas as pd
 
 from screener.config import Config, load_config
+from screener.data.edgar import EdgarProvider
 from screener.data.fmp import FMPProvider
 from screener.data.french import get_ff_factors
 from screener.data.yf import YFinanceProvider
@@ -51,16 +52,24 @@ def _load_universe_and_data(cfg: Config, max_names=None, start=None, end=None, o
     if max_names:
         uni = uni.head(max_names)  # bound the universe to stay under FMP free-tier daily call cap
     tickers = uni["ticker"].tolist()
-    provider = FMPProvider(api_key_env=cfg.data.fmp_api_key_env, cache_dir=cfg.data.cache_dir)
+    provider = _make_provider(cfg)
     try:
         fund = provider.get_fundamentals(tickers)
         prices = provider.get_prices(tickers, start, end)
     except RuntimeError as e:
-        print(f"[run.py] FMP unavailable ({e}); falling back to yfinance for prices "
-              f"(fundamentals require FMP for point-in-time correctness).", file=sys.stderr)
+        print(f"[run.py] provider unavailable ({e}); using yfinance for prices only "
+              f"(fundamentals need FMP/EDGAR for point-in-time correctness).", file=sys.stderr)
         prices = YFinanceProvider().get_prices(tickers, start, end)
         fund = pd.DataFrame(columns=["ticker", "period_end", "filing_date"])
     return uni, fund, prices
+
+
+def _make_provider(cfg: Config):
+    if cfg.data.provider == "edgar":
+        return EdgarProvider(contact_email=cfg.data.edgar_contact, cache_dir=cfg.data.cache_dir)
+    if cfg.data.provider == "yfinance":
+        return YFinanceProvider()
+    return FMPProvider(api_key_env=cfg.data.fmp_api_key_env, cache_dir=cfg.data.cache_dir)
 
 
 def _composite_at(fund, prices, uni, cfg: Config, as_of, sleeve_weights: dict[str, float]):

@@ -13,8 +13,8 @@ Most retail "stock screeners" rank on trailing ratios computed off today's numbe
 regard for when those numbers actually became public, and no answer to "is this premium already
 explained by a known factor?" This project is built to institutional standards instead:
 
-- **No look-ahead.** Fundamentals are gated by their SEC **filing date** (FMP `fillingDate`), not
-  the fiscal period end — a Q1 number isn't usable until it was actually filed.
+- **No look-ahead.** Fundamentals are gated by their SEC **filing date** (the XBRL `filed`
+  timestamp), not the fiscal period end — a Q1 number isn't usable until it was actually filed.
 - **Sector-neutral, robust normalization.** MAD (median absolute deviation) z-scores, computed
   within a finest-first GICS hierarchy (industry group → sector → cross-sectional), so a screen
   isn't secretly just "buy tech."
@@ -33,8 +33,9 @@ config.yaml          pre-registered, Pydantic-validated run configuration
 screener/
   universe.py         S&P 500 constituents + GICS sector / industry-group classification
   data/
-    fmp.py            point-in-time fundamentals (SEC filing-date gated) + prices
-    yf.py             adjusted total-return price fallback (no API key)
+    edgar.py          SEC EDGAR XBRL point-in-time fundamentals (default; free, full history)
+    fmp.py            alternative point-in-time fundamentals provider (FMP /stable API)
+    yf.py             adjusted total-return prices (no API key)
     french.py          Fama-French 5 + momentum factor returns (Ken French Data Library)
     quality.py        data-quality gate: hard bounds, MAD winsorization, negative-denominator masks
     cache.py          incremental parquet cache (works within FMP's free-tier rate limit)
@@ -78,28 +79,37 @@ standard errors.
 
 ## Data
 
+Everything runs on **free** sources — no API key required for the default path:
+
+- **Fundamentals (default): SEC EDGAR XBRL** (`data.sec.gov`). Full multi-decade history, genuinely
+  point-in-time via each fact's SEC `filed` date, for every US filer — no key, no whitelist. Flow
+  items are reconstructed into clean quarters (direct 3-month values, with the year-to-date ladder
+  differenced to fill gaps such as cash-flow statements); EBITDA / FCF / total debt are derived from
+  their components. FMP (`data.provider: fmp`) is supported as an alternative but its free tier is
+  limited to ~5 quarters and a whitelist of names.
+- **Prices:** `yfinance` (`auto_adjust=True`) — split-and-dividend-adjusted total-return closes,
+  never raw closes.
+- **Factor returns:** the Ken French Data Library, via `pandas_datareader`.
 - **Universe:** current S&P 500 constituents (Wikipedia). Using today's membership list means the
-  backtest has **survivorship bias on the constituent list** — a documented, honest limitation.
-  Fundamental look-ahead is a separate, solved problem (SEC filing dates).
-- **Fundamentals:** [Financial Modeling Prep](https://financialmodelingprep.com) (free tier),
-  point-in-time via `fillingDate`.
-- **Prices:** FMP adjusted closes, falling back to `yfinance` (`auto_adjust=True`) if FMP is
-  unavailable — both are split-and-dividend-adjusted total-return series, never raw closes.
-- **Factor returns:** the Ken French Data Library, via `pandas_datareader` (free, no key).
+  backtest has **survivorship bias on the constituent list** — a documented limitation (fundamental
+  look-ahead is separately eliminated via filing dates).
 
 ## Running it
 
+No API key needed — the default provider is SEC EDGAR.
+
 ```bash
 pip install -e ".[dev]"
-setx FMP_API_KEY "your_key"      # free tier at financialmodelingprep.com; open a NEW terminal after
 
 python run.py screen                    # latest ranked screen + concentration diagnostics
 python run.py backtest --freq monthly   # IC, quintile spread, turnover
 python run.py decompose                 # FF5+UMD alpha decomposition of the Q5-Q1 spread
 python run.py export                    # write outputs/*.parquet for the dashboard
 
-streamlit run dashboard/app.py          # browse the results
+streamlit run dashboard/app.py          # browse the results  (pip install -e ".[dashboard]")
 ```
+
+`--max-names N` bounds the universe (handy for a quick run); omit it for the full S&P 500.
 
 Tests (fixtures only, no network — this is what CI runs):
 
@@ -107,40 +117,33 @@ Tests (fixtures only, no network — this is what CI runs):
 pytest -q
 ```
 
-### Live demo on the FMP free tier
+## Results (real data)
 
-FMP's free tier serves point-in-time fundamentals for only a whitelist of large-cap
-names (and the most recent ~5 quarters). `demo_tickers.txt` is a ready-made subset of 32
-free-accessible S&P 500 names spanning six sectors, so the pipeline runs end-to-end on real data:
+A monthly backtest over 2015–2024 on real EDGAR fundamentals + yfinance total-return prices
+(50-name large-cap slice, `python run.py backtest --max-names 50` then `decompose`):
 
-```bash
-python run.py screen --tickers "$(cat demo_tickers.txt)"
-python run.py export
-```
+| metric | value |
+|---|---|
+| Rebalances | 118 (monthly) |
+| Mean Information Coefficient | +0.025 (t ≈ 1.65) |
+| Q5−Q1 spread | +27 bps/month (~3.3%/yr) |
+| FF5+UMD alpha (annualized) | +3.0%, **Newey-West t ≈ 0.6** |
+| Dominant factor loading | HML (value) +0.18 |
 
-Example real output (screen as of 2026-07):
-
-| rank | ticker | sector | composite |
-|---|---|---|---|
-| 1 | AMD | Information Technology | 1.48 |
-| 2 | C | Financials | 1.11 |
-| 3 | GOOGL | Communication Services | 1.05 |
-
-The **full 500-name universe and the historical backtest/decomposition** require a paid FMP tier
-(or another point-in-time fundamentals source) — see Limitations. All the methodology is validated
-on synthetic fixtures in CI regardless.
+The honest read: the composite produces a positive raw spread with a real value tilt, but at this
+universe size the alpha is **not statistically distinguishable from zero after controlling for the
+known factors** — which is exactly what the FF decomposition exists to reveal. A larger universe and
+point-in-time index membership are the natural next steps (see Limitations).
 
 ## Limitations
 
-- **Data access, not methodology, is the binding constraint on the free tier.** FMP's free plan
-  serves point-in-time fundamentals only for a whitelist of large caps and only the most recent
-  ~5 quarters. That's enough for a live *current* screen on the mega-caps (see the demo above), but
-  **the decade-long quintile backtest and FF5+UMD decomposition need deeper history across the full
-  universe — i.e. a paid FMP tier or an equivalent PiT source.** The backtest/decomposition code is
-  fully implemented and unit-tested; it's gated on data, not correctness.
 - **Survivorship on the constituent list** — the screen uses today's S&P 500 membership, not the
-  historical roster at each rebalance date. A future extension would source point-in-time index
-  membership; for now this is a documented trade-off, not a hidden flaw.
+  historical roster at each rebalance date, so delisted/removed names are absent from the backtest.
+  This is the main remaining bias; a future extension would source point-in-time index membership.
+  (Fundamental look-ahead is *not* a problem here — it's eliminated via SEC filing dates.)
+- **EDGAR coverage is best for recent years** — derived quantities (EBITDA, FCF, total debt) depend
+  on XBRL tags that are sparser in older filings, so those factors carry more NaNs pre-2015. The
+  quality gate handles missing values (a factor simply doesn't contribute for that name).
 - **MAD can be noisy in small groups** — mitigated by the finest-first fallback hierarchy with a
   reported fallback percentage, but not eliminated.
 - **Transaction costs are modeled, not simulated** — commission, spread, and short-rebate are

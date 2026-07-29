@@ -21,8 +21,9 @@ class UniverseConfig(BaseModel):
 
 
 class DataConfig(BaseModel):
-    provider: Literal["fmp", "yfinance"] = "fmp"
+    provider: Literal["fmp", "edgar", "yfinance"] = "edgar"
     fmp_api_key_env: str = "FMP_API_KEY"
+    edgar_contact: str = "adilip407@gmail.com"
     cache_dir: str = ".cache"
     fundamentals_pit: bool = True
 

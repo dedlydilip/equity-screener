@@ -10,10 +10,11 @@ universe:
   source: wikipedia          # wikipedia (no key) | fmp
 
 data:
-  provider: fmp              # fmp (PiT fundamentals) | yfinance (no key, thinner)
+  provider: edgar            # edgar (SEC XBRL, free, full history) | fmp | yfinance
   fmp_api_key_env: FMP_API_KEY
+  edgar_contact: adilip407@gmail.com   # SEC fair-access policy requires a contact UA
   cache_dir: .cache
-  fundamentals_pit: true     # gate fundamentals by SEC fillingDate/acceptedDate
+  fundamentals_pit: true     # gate fundamentals by SEC filing date
 
 # Raw factor line-items per sleeve (weights within a sleeve; normalized internally)
 factors:
