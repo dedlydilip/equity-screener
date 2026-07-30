@@ -61,6 +61,12 @@ def _month_ends(start: str, end: str, freq: str) -> pd.DatetimeIndex:
 
 
 def _load_universe_and_data(cfg: Config, max_names=None, start=None, end=None, only=None):
+    """Load universe, point-in-time fundamentals, and adjusted prices.
+
+    Fails CLOSED: a factor screen/backtest is meaningless without point-in-time
+    fundamentals, so a provider that cannot supply them (or supplies none) aborts
+    the run rather than silently continuing on an empty frame.
+    """
     start = start or cfg.backtest.start
     end = end or cfg.backtest.end
     uni = get_sp500()
@@ -72,12 +78,13 @@ def _load_universe_and_data(cfg: Config, max_names=None, start=None, end=None, o
     provider = _make_provider(cfg)
     try:
         fund = provider.get_fundamentals(tickers)
-        prices = provider.get_prices(tickers, start, end)
-    except RuntimeError as e:
-        print(f"[run.py] provider unavailable ({e}); using yfinance for prices only "
-              f"(fundamentals need FMP/EDGAR for point-in-time correctness).", file=sys.stderr)
-        prices = YFinanceProvider().get_prices(tickers, start, end)
-        fund = pd.DataFrame(columns=["ticker", "period_end", "filing_date"])
+    except NotImplementedError:
+        sys.exit(f"[run.py] provider '{cfg.data.provider}' has no point-in-time fundamentals. "
+                 f"Set data.provider to 'edgar' or 'fmp' in config.yaml.")
+    prices = provider.get_prices(tickers, start, end)
+    if fund is None or fund.empty:
+        sys.exit("[run.py] no point-in-time fundamentals were returned — aborting rather than "
+                 "producing a factor screen with no fundamentals. Check the provider/universe.")
     return uni, fund, prices
 
 
@@ -355,7 +362,8 @@ def cmd_dividend(cfg: Config, con, max_names=None) -> None:
     pit = pit_fundamentals(fund, as_of)
     price = price_asof(prices, as_of)
     tickers = pit.index.intersection(price.index)
-    divs = YFinanceProvider(cfg.data.cache_dir).get_dividends(list(tickers)).set_index("ticker")
+    divs = YFinanceProvider(cfg.data.cache_dir).get_dividends(
+        list(tickers), as_of=as_of).set_index("ticker")
 
     dividends_ttm = divs["dividends_ttm"].reindex(tickers)
     shares = pit.loc[tickers, "shares_diluted"]

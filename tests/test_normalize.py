@@ -85,6 +85,29 @@ def test_composite_is_weight_normalized():
     assert np.isclose(out["B"], 0.5)
 
 
+def test_composite_renormalizes_across_present_sleeves():
+    # B is missing the momentum sleeve; it must be renormalized to the mean of its
+    # two present sleeves (1.0), NOT biased toward 0 by treating momentum as neutral.
+    idx = ["A", "B"]
+    z = {"value": pd.Series([1.0, 1.0], index=idx),
+         "quality": pd.Series([1.0, 1.0], index=idx),
+         "momentum": pd.Series([1.0, np.nan], index=idx)}
+    out = composite(z, {"value": 1 / 3, "quality": 1 / 3, "momentum": 1 / 3})
+    assert np.isclose(out["A"], 1.0)
+    assert np.isclose(out["B"], 1.0)  # renormalized, not 0.667
+
+
+def test_composite_drops_names_below_min_coverage():
+    # B has only the value sleeve (1 of 3) -> below min_sleeves=2 -> dropped (NaN).
+    idx = ["A", "B"]
+    z = {"value": pd.Series([1.0, 2.0], index=idx),
+         "quality": pd.Series([1.0, np.nan], index=idx),
+         "momentum": pd.Series([1.0, np.nan], index=idx)}
+    out = composite(z, {"value": 1 / 3, "quality": 1 / 3, "momentum": 1 / 3}, min_sleeves=2)
+    assert np.isclose(out["A"], 1.0)
+    assert pd.isna(out["B"])
+
+
 def test_burn_in_gives_equal_weights_before_lookback_window_exists():
     sleeves = pd.DataFrame(np.random.default_rng(0).normal(0, 0.02, size=(6, 3)),
                             columns=["value", "quality", "momentum"])

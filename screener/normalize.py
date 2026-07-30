@@ -88,16 +88,30 @@ def sector_neutral_z(
     return z, pct
 
 
-def composite(z_by_sleeve: dict[str, pd.Series], weights: dict[str, float]) -> pd.Series:
-    """Weight-normalized sum of sleeve z-scores into one composite score."""
+def composite(
+    z_by_sleeve: dict[str, pd.Series], weights: dict[str, float], min_sleeves: int = 2
+) -> pd.Series:
+    """Weighted mean of the sleeve z-scores a name actually has.
+
+    A missing sleeve (NaN z — e.g. momentum before 12 months of history exists) is
+    NOT treated as a neutral 0: the weights are renormalized across the sleeves that
+    are present, so an under-covered name is neither silently biased toward the
+    median nor given an artificial score. A name with fewer than ``min_sleeves``
+    present sleeves is left NaN (dropped) rather than ranked on too little signal.
+    """
     idx = next(iter(z_by_sleeve.values())).index
-    out = pd.Series(0.0, index=idx)
-    wsum = 0.0
+    num = pd.Series(0.0, index=idx)
+    wsum = pd.Series(0.0, index=idx)
+    count = pd.Series(0, index=idx)
     for sleeve, z in z_by_sleeve.items():
         w = weights[sleeve]
-        out = out.add(w * z.reindex(idx), fill_value=0.0)
-        wsum += w
-    return out / wsum if wsum else out
+        zz = z.reindex(idx)
+        present = zz.notna()
+        num = num.add((w * zz).where(present, 0.0), fill_value=0.0)
+        wsum = wsum.add(present.astype(float) * w, fill_value=0.0)
+        count = count.add(present.astype(int), fill_value=0)
+    out = num / wsum.where(wsum > 0)
+    return out.where(count >= min_sleeves)
 
 
 def _cap_and_redistribute(w: pd.Series, cap: float) -> pd.Series:

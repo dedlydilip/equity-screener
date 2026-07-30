@@ -13,8 +13,11 @@ Most retail "stock screeners" rank on trailing ratios computed off today's numbe
 regard for when those numbers actually became public, and no answer to "is this premium already
 explained by a known factor?" This project is built to institutional standards instead:
 
-- **No look-ahead.** Fundamentals are gated by their SEC **filing date** (the XBRL `filed`
-  timestamp), not the fiscal period end — a Q1 number isn't usable until it was actually filed.
+- **Fundamental look-ahead controlled.** Fundamentals are gated by their SEC **filing date** (the
+  XBRL `filed` timestamp), *strictly before* the rebalance date — a Q1 number isn't usable until it
+  was actually filed. Two **residual** look-aheads are known and disclosed, not hidden: the universe
+  uses **current** S&P 500 membership and **current** GICS classification applied to all history
+  (survivorship + classification bias). See Limitations.
 - **Sector-neutral, robust normalization.** MAD (median absolute deviation) z-scores, computed
   within a finest-first GICS hierarchy (industry group → sector → cross-sectional), so a screen
   isn't secretly just "buy tech."
@@ -68,24 +71,30 @@ run.py                CLI: screen | backtest | decompose | optimize | multiasset
 **Normalization:** robust z-score `(x − median) / (1.4826 × MAD)` within a group, clipped at ±5
 MAD. Groups follow a finest-first fallback hierarchy — GICS industry group (min 20 names) → GICS
 sector (min 20) → the full cross-section as a last resort — so a small industry group doesn't get
-a noisy median. The fallback split is reported with every run.
+a noisy median. The fallback split (% of names resolved at each level) is reported for the screen.
 
-**Composite:** sleeve z-scores are blended with inverse-volatility weights computed from each
-sleeve's own trailing 12-month long-short return series, capped at 50% per sleeve (redistributed
-if exceeded), with a **12-month equal-weight burn-in** at the start of the backtest to avoid using
-a lookback window that doesn't exist yet.
+**Composite:** the three sleeve z-scores are combined into one score as the **weight-normalized mean
+of the sleeves a name actually has** — a missing sleeve (e.g. momentum before 12 months of history
+exists) is renormalized away rather than treated as a neutral 0, and a name with fewer than two
+present sleeves is dropped rather than ranked on too little signal. The current pipeline uses
+**equal sleeve weights**; an inverse-volatility sleeve-weighting scheme (with a 12-month burn-in and a
+50% cap) is implemented and unit-tested in `normalize.py` but is **not yet wired into the backtest**
+(see Roadmap).
 
 **Validation:** Information Coefficient (Spearman) with decay at 1/3/5-month lags; a quintile
-backtest (Sharpe over the Ken French risk-free rate, Max Drawdown of the Q5−Q1 spread); turnover
-per-rebalance and annualized; net-of-cost returns (5 bps commission + 10 bps spread + 25 bps short
-rebate, per side); and the FF5+UMD alpha decomposition described above, with Newey-West
-standard errors.
+backtest (Q1..Q5 forward returns and the Q5−Q1 spread; the dashboard shows the spread's Sharpe and
+Max Drawdown); and the **FF5 + UMD alpha decomposition** (Newey-West standard errors) — the headline
+research layer. Transaction costs, turnover, net-of-cost returns, a risk-free-rate Sharpe inside the
+backtest, and a monthly-vs-quarterly comparison exist as functions/config but are **not yet wired
+into `run.py`** (see Roadmap); today's IC t-stat is an i.i.d. approximation, not HAC.
 
 **Portfolio construction & CAPM:** each screened name gets a CAPM beta and alpha (regressing its
 excess return on the market factor, Newey-West errors), shown on a Security Market Line. A long-only
 mean-variance optimizer then produces the **maximum-Sharpe (tangency)** and **minimum-variance**
 portfolios plus the **efficient frontier** — the tangency portfolio *is* the CAPM market portfolio,
-so the betas and the optimized weights are two views of one model.
+so the betas and the optimized weights are two views of one model. This is an **in-sample,
+descriptive** view: it optimizes over today's screened names using their full-history sample
+mean/covariance, so the reported Sharpe is not an out-of-sample tradeable result (see Limitations).
 
 **Multi-asset allocation:** the same optimizer runs across asset classes represented by liquid ETFs —
 equities (SPY), bonds (AGG/TLT/IEF/LQD/HYG/TIP), and commodities (GLD/SLV/USO/DBC/DBA/CPER). Bonds and
@@ -94,7 +103,24 @@ ETF proxies, never through the factor screen.
 
 **Dividend income:** a separate screen ranking on trailing-12-month dividend yield but gated on
 **payout sustainability** (dividends / earnings, from the same EDGAR data) — a high yield funded by
-nearly all of earnings is a cut waiting to happen, so those are dropped.
+nearly all of earnings is a cut waiting to happen, so those are dropped. Trailing yield currently
+includes one-off **special/variable** dividends (e.g. Progressive's large annual variable payout),
+which overstate recurring income; separating regular from special dividends is on the Roadmap.
+
+## Roadmap (implemented as tested functions/config, but NOT yet wired into the pipeline)
+
+Being explicit so the claims above are not overstated — these are built and unit-tested at the
+function level, and wiring them into `run.py`/the backtest is in progress:
+
+- **Inverse-volatility sleeve weighting + 12-month burn-in + 50% cap** (`normalize.inverse_vol_weights`).
+- **Transaction costs, turnover, net-of-cost returns, risk-free-rate Sharpe, Max-Drawdown** reported
+  and persisted *inside* the backtest (`validate.turnover/net_of_cost/sharpe/max_drawdown`).
+- **Monthly-vs-quarterly** rebalance comparison in one run.
+- **HAC (Newey-West) IC t-statistic**; per-date fallback-% persistence.
+- **Dated shares-outstanding** for market cap (currently weighted-average diluted shares); strict
+  four-quarter TTM; financial-sector-specific factor handling; effective-dated GICS/index membership.
+- **SQL** surfaced in the dashboard; a reproducibility **manifest**; an analysis **notebook**; a
+  built **Power BI `.pbix`**.
 
 ## Data
 
@@ -141,8 +167,13 @@ pytest -q
 
 ## Results (real data)
 
-Full S&P 500 universe, monthly 2015–2024, on real EDGAR fundamentals + yfinance total-return prices
-(`python run.py screen`, then `backtest` / `decompose`):
+> **Being regenerated.** The figures below predate a round of correctness fixes (strictly-before
+> filing gate, composite renormalization, dividend TTM window) and a set of data-correctness changes
+> in progress; they will be re-run and re-published from a reproducibility manifest. Treat them as
+> indicative, not final.
+
+Full S&P 500 universe, monthly backtest **2015-01 → 2024-10 (118 rebalances)**, on real EDGAR
+fundamentals + yfinance total-return prices (`python run.py screen`, then `backtest` / `decompose`):
 
 | metric | value |
 |---|---|
@@ -166,8 +197,16 @@ index membership (removes survivorship bias) and inverse-vol sleeve weighting in
 
 - **Survivorship on the constituent list** — the screen uses today's S&P 500 membership, not the
   historical roster at each rebalance date, so delisted/removed names are absent from the backtest.
-  This is the main remaining bias; a future extension would source point-in-time index membership.
-  (Fundamental look-ahead is *not* a problem here — it's eliminated via SEC filing dates.)
+- **Classification look-ahead** — GICS sector/industry-group labels are today's, applied to all
+  history, so the sector-neutral normalization uses classifications a historical investor didn't have.
+  Both this and survivorship need effective-dated index membership + classification (Roadmap); until
+  then they are disclosed, not fixed. (Fundamental look-ahead *is* controlled — SEC filing dates,
+  strictly before the trade date.)
+- **Market cap uses weighted-average diluted shares** (the EDGAR income-statement share count), not
+  point-in-time shares outstanding — a modest distortion to every price-based ratio, being replaced
+  with dated `EntityCommonStockSharesOutstanding` (Roadmap).
+- **The CAPM/optimizer results are in-sample and descriptive** — full-history sample mean/covariance
+  over today's screened names; not an out-of-sample tradeable strategy.
 - **EDGAR coverage is best for recent years** — derived quantities (EBITDA, FCF, total debt) depend
   on XBRL tags that are sparser in older filings, so those factors carry more NaNs pre-2015. The
   quality gate handles missing values (a factor simply doesn't contribute for that name).

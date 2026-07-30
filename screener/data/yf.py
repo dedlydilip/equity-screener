@@ -38,17 +38,21 @@ class YFinanceProvider(DataProvider):
         close.index = pd.to_datetime(close.index)
         return close.dropna(how="all")
 
-    def get_dividends(self, tickers: list[str]) -> pd.DataFrame:
-        """Trailing-12-month cash dividend per share, per ticker (cached).
+    def get_dividends(self, tickers: list[str], as_of=None) -> pd.DataFrame:
+        """Trailing-12-month cash dividend per share as of ``as_of`` (default today).
 
-        Returns columns ``ticker, dividends_ttm``. Combined with the current
-        price this yields the dividend yield; combined with EDGAR net income it
-        yields the payout ratio. Note this is *cash paid* over the last year, a
-        backward-looking income proxy — not a forward-looking dividend forecast.
+        Returns columns ``ticker, dividends_ttm`` = cash dividends with an ex-date in
+        ``(as_of - 1 year, as_of]``. The window is anchored to the as-of date, NOT to
+        the stock's last ex-dividend date — anchoring to the last ex-date can capture
+        five payments for a name that shifted its pay schedule, overstating the yield.
+        Backward-looking income proxy, not a forward dividend forecast.
         """
+        as_of = pd.Timestamp(as_of) if as_of is not None else pd.Timestamp.today()
+        as_of = as_of.normalize()
+        cutoff = as_of - pd.DateOffset(years=1)
         rows = []
         for t in tickers:
-            key = f"yf_div_{t}"
+            key = f"yf_div_{t}_{as_of.date()}"
             cached = self._cache.get(key)
             if cached is not None:
                 rows.append(cached)
@@ -60,8 +64,7 @@ class YFinanceProvider(DataProvider):
             ttm = 0.0
             if div is not None and len(div):
                 div.index = pd.to_datetime(div.index, utc=True).tz_localize(None)
-                cutoff = div.index.max() - pd.DateOffset(years=1)
-                ttm = float(div[div.index > cutoff].sum())
+                ttm = float(div[(div.index > cutoff) & (div.index <= as_of)].sum())
             rec = pd.DataFrame([{"ticker": t, "dividends_ttm": ttm}])
             self._cache.put(key, rec)
             rows.append(rec)

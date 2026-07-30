@@ -8,6 +8,12 @@ the factor engine — no extra fundamentals source needed.
 
 Yield here is trailing-twelve-month cash dividends / current price: a
 backward-looking income measure, not a forward dividend forecast.
+
+CAVEAT (documented limitation): trailing cash dividends include one-off
+**special / variable** dividends (e.g. Progressive's large annual variable
+payout), which inflate the trailing yield relative to the recurring income an
+investor should expect. Separating regular from special dividends is a planned
+refinement; for now the trailing figure is reported as-is and this caveat stands.
 """
 
 from __future__ import annotations

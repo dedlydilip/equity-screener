@@ -34,7 +34,10 @@ def pit_fundamentals(fund: pd.DataFrame, as_of) -> pd.DataFrame:
     """Per ticker: TTM sums of flow items + latest stock items, using only filings
     known by ``as_of`` (filing_date <= as_of)."""
     as_of = pd.Timestamp(as_of)
-    known = fund[fund["filing_date"] <= as_of].sort_values(["ticker", "period_end"])
+    # Strictly-before: a fundamental filed *on* the rebalance date is NOT usable at
+    # that date's close (EDGAR gives a filing date, not an intraday acceptance time),
+    # so we only admit filings known before the trade date to avoid same-day look-ahead.
+    known = fund[fund["filing_date"] < as_of].sort_values(["ticker", "period_end"])
     out = {}
     for tkr, g in known.groupby("ticker"):
         last4 = g.tail(4)
@@ -89,7 +92,7 @@ def compute_factors(fund: pd.DataFrame, prices: pd.DataFrame, as_of, gates) -> p
     f["fcf_yield"] = fcf / mcap
     ev_ebitda_inv = (ebitda / ev).where(ev > 0)
     if gates.drop_negative_ebitda_ev:
-        ev_ebitda_inv = ev_ebitda_inv.where(ebitda >= 0)
+        ev_ebitda_inv = ev_ebitda_inv.where(ebitda > 0)   # non-positive EBITDA is not "cheap"
     f["ev_ebitda_inv"] = ev_ebitda_inv
     # --- Quality (higher = better) ---
     f["roe"] = (ni / book).where(book > 0)

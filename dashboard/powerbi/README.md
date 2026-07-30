@@ -5,8 +5,13 @@ free to host on Streamlit Cloud. Power BI is included as a second artifact to sh
 BI-tool fluency (relevant to your accounting-internship Power BI experience).
 
 ## Build it from the parquet exports
-1. Run the pipeline so `outputs/*.parquet` exist (`python run.py screen backtest decompose`,
-   then `export`).
+1. Run the pipeline so `outputs/*.parquet` exist — one command at a time:
+   ```bash
+   python run.py screen
+   python run.py backtest --freq monthly
+   python run.py decompose
+   python run.py export
+   ```
 2. In **Power BI Desktop**: *Get Data → Parquet* (or *Folder* → `outputs/`) and load
    `screen`, `backtest_quintiles`, `factor_panel`, `ff_decomposition`, `universe`.
 3. Model: relate `screen.ticker` and `factor_panel.ticker` to `universe.ticker`.
