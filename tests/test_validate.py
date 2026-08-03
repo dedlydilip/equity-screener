@@ -12,9 +12,11 @@ from screener.validate import (
     ic_summary,
     information_coefficient,
     max_drawdown,
+    net_of_cost,
     quintile_returns,
     sharpe,
     turnover,
+    weighted_quintile_returns,
 )
 
 
@@ -68,6 +70,59 @@ def test_turnover_is_zero_for_static_holdings():
     assert t["per_rebalance_two_way"] == pytest.approx(0.0, abs=1e-9)
 
 
+def test_turnover_is_nonzero_for_a_full_rotation():
+    # Complete portfolio swap each rebalance: A/B -> C/D -> A/B ...
+    idx = pd.date_range("2020-01-31", periods=4, freq="ME")
+    h = pd.DataFrame(0.0, index=idx, columns=list("ABCD"))
+    h.loc[idx[0::2], ["A", "B"]] = 0.5
+    h.loc[idx[1::2], ["C", "D"]] = 0.5
+    t = turnover(h, ppy=12)
+    # Every rebalance fully exits the old names and enters new ones -> one-way
+    # turnover = 1.0 (sum|delta|/2 = 2.0/2), two-way = 2.0.
+    assert t["per_rebalance_two_way"] == pytest.approx(2.0, abs=1e-9)
+    assert t["annualized_two_way"] == pytest.approx(24.0, abs=1e-9)
+
+
+def test_net_of_cost_subtracts_a_larger_drag_for_higher_turnover():
+    idx = pd.date_range("2020-01-31", periods=6, freq="ME")
+    gross = pd.Series(0.02, index=idx)
+    low_turn_net = net_of_cost(gross, turnover_per_rebalance=0.2, cost_bps_per_side=15)
+    high_turn_net = net_of_cost(gross, turnover_per_rebalance=1.0, cost_bps_per_side=15)
+    assert (low_turn_net < gross).all()
+    assert (high_turn_net < low_turn_net).all()  # more turnover -> more cost drag
+    assert net_of_cost(gross, 0.0, 15).equals(gross)  # zero turnover -> zero cost
+
+
+def test_weighted_quintile_returns_market_cap_favors_the_larger_name(signal_panel):
+    scores, fwd = signal_panel
+    # Give every name in the panel a market cap, largest for the last ticker
+    # alphabetically in each bucket, so market-cap weighting is distinguishable
+    # from equal weighting.
+    tickers = scores.columns
+    mc_row = pd.Series(np.arange(1, len(tickers) + 1, dtype=float), index=tickers)
+    market_cap = pd.DataFrame([mc_row] * len(scores), index=scores.index)
+
+    eq = quintile_returns(scores, fwd)
+    weighted = weighted_quintile_returns(scores, fwd, method="market_cap", market_cap=market_cap)
+    assert list(weighted.columns) == list(eq.columns)
+    assert weighted["Q5"].notna().any()
+    # Market-cap weighting concentrates in the largest names -> a different
+    # (not necessarily larger) return than the naive equal-weight average.
+    assert not weighted["Q5"].equals(eq["Q5"])
+
+
+def test_ic_summary_reports_both_iid_and_hac_t_stats(signal_panel):
+    scores, fwd = signal_panel
+    ic = information_coefficient(scores, fwd)
+    s = ic_summary(ic)
+    assert "t_stat" in s and "t_stat_hac" in s
+    assert np.isfinite(s["t_stat"])
+    assert np.isfinite(s["t_stat_hac"])
+    # For a strong, fairly stable signal the two needn't match, but both
+    # should agree on the (positive) sign of the effect.
+    assert (s["t_stat"] > 0) == (s["t_stat_hac"] > 0)
+
+
 def test_ff_decompose_recovers_known_alpha_and_loading():
     rng = np.random.default_rng(2)
     months = pd.date_range("2018-01-31", periods=72, freq="ME")
@@ -98,3 +153,16 @@ def test_ff_decompose_rf_handling_differs_between_spread_and_single_leg():
 
     diff = as_spread["alpha_monthly"] - as_leg["alpha_monthly"]
     assert diff == pytest.approx(0.003, abs=1e-9)  # exactly the constant RF
+
+
+def test_ff_decompose_ppy_controls_annualization():
+    rng = np.random.default_rng(4)
+    months = pd.date_range("2018-01-31", periods=40, freq="ME")
+    ff = pd.DataFrame(rng.normal(0, 0.02, size=(40, 6)), index=months, columns=FF_COLS)
+    ff["RF"] = 0.001
+    ls = pd.Series(0.01 + rng.normal(0, 0.005, 40), index=months)
+    monthly = ff_decompose(ls, ff, is_long_short=True, ppy=12)
+    quarterly = ff_decompose(ls, ff, is_long_short=True, ppy=4)
+    assert monthly["alpha_monthly"] == pytest.approx(quarterly["alpha_monthly"])  # same regression
+    assert monthly["alpha_annualized"] == pytest.approx(monthly["alpha_monthly"] * 12)
+    assert quarterly["alpha_annualized"] == pytest.approx(quarterly["alpha_monthly"] * 4)

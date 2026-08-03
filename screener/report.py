@@ -9,7 +9,8 @@ from pathlib import Path
 from .db import query, query_file
 
 _TABLES = [
-    "universe", "screen", "factor_panel", "backtest_quintiles", "ff_decomposition", "ic_decay",
+    "universe", "screen", "factor_panel", "backtest_quintiles", "backtest_summary",
+    "normalization_fallback", "ff_decomposition", "ic_decay",
     "capm_betas", "optimal_weights", "efficient_frontier",
     "multiasset_betas", "multiasset_weights", "multiasset_frontier", "dividend_screen",
 ]

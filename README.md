@@ -83,17 +83,26 @@ a noisy median. The fallback split (% of names resolved at each level) is report
 **Composite:** the three sleeve z-scores are combined into one score as the **weight-normalized mean
 of the sleeves a name actually has** — a missing sleeve (e.g. momentum before 12 months of history
 exists) is renormalized away rather than treated as a neutral 0, and a name with fewer than two
-present sleeves is dropped rather than ranked on too little signal. The current pipeline uses
-**equal sleeve weights**; an inverse-volatility sleeve-weighting scheme (with a 12-month burn-in and a
-50% cap) is implemented and unit-tested in `normalize.py` but is **not yet wired into the backtest**
-(see Roadmap).
+present sleeves is dropped rather than ranked on too little signal. Sleeves are blended with
+**inverse-volatility weighting**: each sleeve's own trailing 12-month realized long-short return
+volatility sets its weight (a steadier sleeve gets more say), capped at 50% with any excess
+redistributed proportionally, and defaulting to equal weights during a 12-month no-look-ahead burn-in
+(before a full trailing window of sleeve returns exists). Wired into the backtest itself, not just
+unit-tested: at each rebalance date the sleeve weights are computed only from sleeve returns realized
+*strictly before* that date (`normalize.inverse_vol_weights`).
 
-**Validation:** Information Coefficient (Spearman) with decay at 1/3/5-month lags; a quintile
-backtest (Q1..Q5 forward returns and the Q5−Q1 spread; the dashboard shows the spread's Sharpe and
-Max Drawdown); and the **FF5 + UMD alpha decomposition** (Newey-West standard errors) — the headline
-research layer. Transaction costs, turnover, net-of-cost returns, a risk-free-rate Sharpe inside the
-backtest, and a monthly-vs-quarterly comparison exist as functions/config but are **not yet wired
-into `run.py`** (see Roadmap); today's IC t-stat is an i.i.d. approximation, not HAC.
+**Validation:** Information Coefficient (Spearman), reported with **both an i.i.d. and a Newey-West
+HAC-adjusted t-statistic** (IC is autocorrelated across overlapping rebalances, so HAC is the
+defensible figure), plus decay at 1/3/5-period lags; a quintile backtest (Q1..Q5 forward returns,
+weighted by the configured scheme — equal / market-cap / inverse-vol) with the Q5−Q1 spread's
+**gross and net-of-cost Sharpe**, **Max Drawdown**, and **per-rebalance and annualized turnover**;
+and the **FF5 + UMD alpha decomposition** (Newey-West standard errors) — the headline research layer.
+Transaction costs (commission + spread + short rebate, applied per-side and scaled by realized
+turnover) are subtracted from the gross spread to get the net figures reported above — net Sharpe is
+never allowed to exceed gross by construction. **Monthly and quarterly backtests are run and persisted
+side by side** (a `freq` column on every table, so re-running one frequency never overwrites the
+other's rows), and the sector-neutral fallback percentage is persisted per rebalance date, not just
+printed once for the latest screen.
 
 **Portfolio construction & CAPM:** each screened name gets a CAPM beta and alpha (regressing its
 excess return on the market factor, Newey-West errors), shown on a Security Market Line. A long-only
@@ -116,18 +125,18 @@ small regular one) is separated from the regular yield via a documented heuristi
 trailing median is "special"), so the headline yield reflects recurring income, not a one-time payout —
 the total (incl. specials) is still reported alongside for context.
 
-## Roadmap (implemented as tested functions/config, but NOT yet wired into the pipeline)
+## Roadmap (not yet built)
 
-Being explicit so the claims above are not overstated — these are built and unit-tested at the
-function level, and wiring them into `run.py`/the backtest is in progress:
+Being explicit so the claims above are not overstated:
 
-- **Inverse-volatility sleeve weighting + 12-month burn-in + 50% cap** (`normalize.inverse_vol_weights`).
-- **Transaction costs, turnover, net-of-cost returns, risk-free-rate Sharpe, Max-Drawdown** reported
-  and persisted *inside* the backtest (`validate.turnover/net_of_cost/sharpe/max_drawdown`).
-- **Monthly-vs-quarterly** rebalance comparison in one run.
-- **HAC (Newey-West) IC t-statistic**; per-date fallback-% persistence.
-- **SQL** surfaced in the dashboard; a reproducibility **manifest**; an analysis **notebook**; a
-  built **Power BI `.pbix`**.
+- **SQL as a first-class analytical layer** — `sql/queries.sql` exists but isn't yet executed by the
+  pipeline or surfaced as a dashboard tab.
+- **A reproducibility manifest** (git revision, config hash, data-snapshot dates, provider versions)
+  written alongside every run's outputs.
+- **An analysis notebook** (`notebooks/analysis.ipynb`) walking through the FF decomposition and
+  factor-correlation heatmap outside the dashboard.
+- **A built Power BI `.pbix`** — the data layer is exported and ready; the file itself needs Power BI
+  Desktop, which this environment doesn't have.
 
 ## Data
 
@@ -155,8 +164,9 @@ No API key needed — the default provider is SEC EDGAR.
 pip install -e ".[dev]"
 
 python run.py screen                    # latest ranked screen + concentration diagnostics
-python run.py backtest --freq monthly   # IC, quintile spread, turnover
-python run.py decompose                 # FF5+UMD alpha decomposition of the Q5-Q1 spread
+python run.py backtest                  # IC, quintile spread, costs/turnover — every configured freq
+python run.py backtest --freq monthly   # (or restrict to one frequency)
+python run.py decompose --freq monthly  # FF5+UMD alpha decomposition of the Q5-Q1 spread (per freq)
 python run.py optimize                  # CAPM betas + mean-variance portfolio over the screen
 python run.py multiasset                # cross-asset (equity/bond/commodity ETF) allocation
 python run.py dividend                  # dividend-income screen (yield + payout sustainability)
@@ -175,31 +185,39 @@ pytest -q
 
 ## Results (real data)
 
-> **Being regenerated.** The figures below predate a round of correctness fixes (strictly-before
-> filing gate, composite renormalization, dividend TTM window) and a set of data-correctness changes
-> in progress; they will be re-run and re-published from a reproducibility manifest. Treat them as
-> indicative, not final.
+Full S&P 500 universe (point-in-time membership: 503 current + 242 historically-removed/renamed
+names pulled for the window), **2015-01 → 2024-12**, on real EDGAR fundamentals + yfinance
+total-return prices, both rebalance frequencies persisted side by side in the same run
+(`python run.py screen`, then `backtest` / `decompose`, no `--freq`):
 
-Full S&P 500 universe, monthly backtest **2015-01 → 2024-10 (118 rebalances)**, on real EDGAR
-fundamentals + yfinance total-return prices (`python run.py screen`, then `backtest` / `decompose`):
+| metric | monthly (118 rebalances) | quarterly (38 rebalances) |
+|---|---|---|
+| Mean IC (HAC t-stat) | +0.0067 (t = 0.84) | +0.0120 (t = 0.89) |
+| Q5−Q1 spread, gross / net of costs | +0.15% / **−0.01%** per period | +0.57% / **+0.27%** per period |
+| Sharpe, gross / net of costs | 0.31 / **−0.03** | 0.39 / **0.18** |
+| Max Drawdown (Q5−Q1) | −13.5% | −6.7% |
+| Turnover, per-rebalance / annualized | 40.0% / **480%/yr** | 75.2% / **301%/yr** |
+| FF5+UMD alpha (annualized, NW t) | +1.9% (t = 0.92) | +2.8% (t = 1.54) |
 
-| metric | value |
-|---|---|
-| Screen (latest) | 42 names, effective N ≈ 42 (HHI 0.024) — diversified across sectors |
-| Sector-neutral normalization | **67% of names scored within their GICS industry group**, 30% sector, 3% cross-sectional |
-| Rebalances | 118 (monthly) |
-| Mean Information Coefficient | +0.004 (t ≈ 0.6) |
-| Q5−Q1 spread | +20 bps/month |
-| FF5+UMD alpha (annualized) | +2.3%, **Newey-West t ≈ 1.0** |
-| Loadings | small negative SMB (large-cap tilt), mild positive HML |
+Net figures subtract commission + spread + short-rebate costs (40 bps/side, `config.yaml`) scaled by
+the realized turnover shown alongside.
 
-The honest read: across the full liquid large-cap universe the equal-weighted V/Q/M composite shows a
-small positive spread, but the alpha is **not statistically distinguishable from zero** after FF5+UMD
-— the realistic finding that simple composites are largely arbitraged out of large caps, and exactly
-what the decomposition exists to reveal. The genuine strengths on display are the point-in-time
-discipline, the **sector-neutral normalization actually resolving most names within their industry
-group**, and honest reporting rather than an overfit backtest. Natural next step: inverse-vol sleeve
-weighting in the composite (point-in-time index membership is now implemented — see Data/Roadmap).
+Latest screen: 41 names, effective N ≈ 41 (HHI 0.024, top-10% weight 9.8%) — diversified across
+sectors. Sector-neutral normalization resolved **67–68% of value/quality scores and 67% of momentum
+scores within their GICS industry group**, ~28–33% at the sector level, and under 4% at the full
+cross-section — the hierarchy is doing its job on the full universe rather than falling back to a
+noisy broad median.
+
+**The honest read — this is the finding the pipeline exists to surface, not paper over:** neither
+frequency's signal is statistically distinguishable from zero (HAC IC t-stats of 0.84 and 0.89; FF5+UMD
+alpha NW t-stats of 0.92 and 1.54 are all well under the ~2.0 conventional bar). And **turnover is
+what actually decides whether the weak edge is investable**: at monthly rebalancing the composite
+churns 480%/year, which is expensive enough that transaction costs erase the entire gross spread and
+flip net Sharpe negative (0.31 → −0.03). At quarterly rebalancing turnover drops to 301%/year and
+roughly half the gross edge survives net of costs (0.39 → 0.18), with a shallower drawdown too
+(−6.7% vs. −13.5%). A simple equal/inverse-vol-weighted Value/Quality/Momentum composite over the full
+liquid large-cap S&P 500 has a real but weak, cost-sensitive edge that is not tradeable at monthly
+frequency and only marginally so at quarterly — a realistic result, not an overfit backtest.
 
 ## Limitations
 

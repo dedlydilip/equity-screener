@@ -5,9 +5,10 @@ screen -> quintile backtest -> validate -> DuckDB -> dashboard export.
 Usage (from the repo root):
 
     python run.py screen                 # latest ranked screen
-    python run.py backtest --freq monthly
+    python run.py backtest               # every freq in config's backtest.frequencies_to_test
+    python run.py backtest --freq monthly     # (or restrict to just one)
     python run.py backtest --freq quarterly
-    python run.py decompose              # FF5+UMD alpha decomposition
+    python run.py decompose              # FF5+UMD alpha decomposition (--freq, default monthly)
     python run.py optimize               # CAPM betas + mean-variance optimizer over the screen
     python run.py multiasset             # cross-asset (equity/bond/commodity ETF) allocation
     python run.py dividend               # dividend-income screen (yield + payout sustainability)
@@ -34,7 +35,7 @@ from screener.data.yf import YFinanceProvider
 from screener.db import connect, write_table
 from screener.dividend import build_dividend_screen
 from screener.factors import SLEEVES, compute_factors, pit_fundamentals, price_asof
-from screener.normalize import composite, sector_neutral_z
+from screener.normalize import composite, inverse_vol_weights, sector_neutral_z
 from screener.optimize import (
     efficient_frontier,
     max_sharpe_weights,
@@ -42,17 +43,22 @@ from screener.optimize import (
     portfolio_stats,
 )
 from screener.pit_membership import all_time_tickers, constituents_as_of, get_sp500_changes
-from screener.portfolio import concentration
+from screener.portfolio import assign_quantiles, concentration
 from screener.portfolio import weights as portfolio_weights
 from screener.report import export_for_dashboard
-from screener.screen import build_screen
+from screener.screen import apply_hard_filters, build_screen
 from screener.universe import get_sp500
 from screener.validate import (
     ff_decompose,
     ic_decay,
     ic_summary,
     information_coefficient,
+    max_drawdown,
+    net_of_cost,
     quintile_returns,
+    sharpe,
+    turnover,
+    weighted_quintile_returns,
 )
 
 
@@ -174,7 +180,31 @@ def cmd_screen(cfg: Config, con, max_names=None, only=None) -> None:
           f"effective_n={conc['effective_n']:.1f}")
 
 
-def cmd_backtest(cfg: Config, con, freq: str, max_names=None) -> None:
+def _trailing_vols(prices: pd.DataFrame, as_of, lookback_months: int = 12) -> pd.Series:
+    """Trailing realized volatility (std of monthly returns) per ticker, using
+    only price history STRICTLY BEFORE ``as_of`` -- for inverse-vol weighting
+    within a quintile bucket. Monthly (not daily) returns, matching the
+    convention already used for covariance in optimize.py/cmd_optimize."""
+    as_of = pd.Timestamp(as_of)
+    window = prices[(prices.index >= as_of - pd.DateOffset(months=lookback_months))
+                     & (prices.index < as_of)]
+    if len(window) < 2:
+        return pd.Series(dtype=float)
+    monthly = window.resample("ME").last()
+    return monthly.pct_change().dropna(how="all").std()
+
+
+def cmd_backtest(cfg: Config, con, freq: str | None = None, max_names=None) -> None:
+    """Run the backtest for one frequency, or (if ``freq`` is omitted) every
+    frequency in ``cfg.backtest.frequencies_to_test`` — each write MERGES by
+    ``freq`` rather than clobbering the other frequency's previously-stored rows.
+    """
+    freqs = [freq] if freq else cfg.backtest.frequencies_to_test
+    for f in freqs:
+        _run_one_backtest(cfg, con, f, max_names)
+
+
+def _run_one_backtest(cfg: Config, con, freq: str, max_names=None) -> None:
     # Point-in-time membership: reconstruct historical S&P 500 constituents
     # (Wikipedia's changes table) so each rebalance only scores/holds names
     # that were ACTUALLY index members on that date, mitigating (not fully
@@ -187,82 +217,200 @@ def cmd_backtest(cfg: Config, con, freq: str, max_names=None) -> None:
     changes = get_sp500_changes()
     extra = sorted(all_time_tickers(current_tickers, changes, since=cfg.backtest.start)
                     - current_tickers)
-    print(f"Point-in-time membership: {len(current_tickers)} current constituents + "
+    print(f"[{freq}] Point-in-time membership: {len(current_tickers)} current constituents + "
           f"{len(extra)} historically-removed/renamed names pulled for the {cfg.backtest.start}"
           f"..{cfg.backtest.end} window (some may lack EDGAR/yfinance data post-delisting).")
     uni, fund, prices = _load_universe_and_data(cfg, max_names, extra_tickers=extra)
     dates = _month_ends(cfg.backtest.start, cfg.backtest.end, freq)
     dates = [d for d in dates if d <= prices.index.max()] if not prices.empty else []
     if len(dates) < 3:
-        print("Not enough price history for a backtest yet (need >= 3 rebalance dates).")
+        print(f"[{freq}] Not enough price history for a backtest yet "
+              f"(need >= 3 rebalance dates).")
         return
 
     equal_w = {"value": 1 / 3, "quality": 1 / 3, "momentum": 1 / 3}
-    scores, fwd_returns = {}, {}
+
+    # --- Pass 1: raw factors + per-sleeve z-scores + forward returns at every
+    # date. Sleeve weighting hasn't been decided yet -- z_by_sleeve doesn't
+    # depend on it (composite() is what applies weights), so it's safe to
+    # compute up front and blend afterward with whatever weights pass 2 picks.
+    raw_hist, z_hist, fallback_hist, fwd_returns = {}, {}, {}, {}
     for i, dt in enumerate(dates[:-1]):
-        _, comp, _, _ = _composite_at(fund, prices, uni, cfg, dt, equal_w)
-        members = constituents_as_of(dt, current_tickers, changes)
-        comp = comp.reindex(comp.index.intersection(members))
-        scores[dt] = comp
+        raw, _, fallback_pct, z_by_sleeve = _composite_at(fund, prices, uni, cfg, dt, equal_w)
+        raw_hist[dt] = raw
+        z_hist[dt] = z_by_sleeve
+        fallback_hist[dt] = fallback_pct
         px_now = prices[prices.index <= dt].iloc[-1] if (prices.index <= dt).any() else None
         nxt = dates[i + 1]
         px_next = prices[prices.index <= nxt].iloc[-1] if (prices.index <= nxt).any() else None
         if px_now is not None and px_next is not None:
             fwd_returns[dt] = (px_next / px_now - 1.0)
 
+    fwd_df = pd.DataFrame(fwd_returns).T
+
+    # --- Each sleeve's OWN realized Q5-Q1 spread per date (the "sleeve
+    # long-short return series" inverse_vol_weights needs), built by reusing
+    # quintile_returns() on that sleeve's own z-scores -- not reimplemented.
+    sleeve_names = list(SLEEVES.keys())
+    sleeve_return_cols = {}
+    for sleeve in sleeve_names:
+        sleeve_scores = pd.DataFrame({dt: z_hist[dt][sleeve] for dt in z_hist}).T
+        sr = quintile_returns(sleeve_scores, fwd_df, cfg.portfolio.n_quantiles)
+        sleeve_return_cols[sleeve] = sr["spread"] if "spread" in sr else pd.Series(dtype=float)
+    sleeve_returns_df = pd.DataFrame(sleeve_return_cols).reindex(fwd_df.index).fillna(0.0)
+
+    # --- Pass 2: decide each date's sleeve weights from ONLY prior dates'
+    # realized sleeve returns (inverse_vol_weights itself slices strictly
+    # before as_of_row, so passing the whole series is look-ahead-safe), then
+    # blend the composite, apply hard filters + point-in-time membership.
+    hf = cfg.portfolio.hard_filters
+    scores, market_cap_hist, vols_hist = {}, {}, {}
+    for i, dt in enumerate(sleeve_returns_df.index):
+        sleeve_w = inverse_vol_weights(
+            sleeve_returns_df, lookback=cfg.weighting.vol_lookback_months,
+            max_weight=cfg.weighting.max_sleeve_weight,
+            burn_in=cfg.weighting.burn_in_months, as_of_row=i)
+        raw, z_by_sleeve = raw_hist[dt], z_hist[dt]
+        comp = composite(z_by_sleeve, sleeve_w, min_sleeves=2)
+        eligible = apply_hard_filters(raw, hf)
+        members = constituents_as_of(dt, current_tickers, changes) & set(eligible)
+        scores[dt] = comp.reindex(comp.index.intersection(members))
+        market_cap_hist[dt] = raw["market_cap"]
+        vols_hist[dt] = _trailing_vols(prices, dt, cfg.weighting.vol_lookback_months)
+
     scores_df = pd.DataFrame(scores).T
-    fwd_df = pd.DataFrame(fwd_returns).T.reindex(scores_df.index)
+    fwd_df = fwd_df.reindex(scores_df.index)
+    market_cap_df = pd.DataFrame(market_cap_hist).T.reindex(scores_df.index)
+    vols_df = pd.DataFrame(vols_hist).T.reindex(scores_df.index)
 
     ic = information_coefficient(scores_df, fwd_df)
     ic_stats = ic_summary(ic)
-    qr = quintile_returns(scores_df, fwd_df, cfg.portfolio.n_quantiles)
+    method = cfg.portfolio.weighting
+    qr = (quintile_returns(scores_df, fwd_df, cfg.portfolio.n_quantiles) if method == "equal"
+          else weighted_quintile_returns(scores_df, fwd_df, method, market_cap_df, vols_df,
+                                          cfg.portfolio.n_quantiles))
 
     long_rows = []
     for dt, row in qr.iterrows():
         for q in range(1, cfg.portfolio.n_quantiles + 1):
             col = f"Q{q}"
             if col in row and pd.notna(row[col]):
-                long_rows.append({"date": dt, "quantile": q, "ret": row[col]})
-    write_table(con, "backtest_quintiles", pd.DataFrame(long_rows))
+                long_rows.append({"freq": freq, "date": dt, "quantile": q, "ret": row[col]})
+    _merge_write_by_freq(con, "backtest_quintiles", pd.DataFrame(long_rows), freq)
 
     # IC decay: how fast the signal's predictive power fades at longer horizons
     # (lag 0 = same-period IC already computed above; reused as the curve's start).
     decay = ic_decay(scores_df, fwd_df, lags=(1, 3, 5))
-    decay_rows = [{"lag": 0, "ic": ic_stats["mean_ic"]}]
-    decay_rows += [{"lag": int(k.split("_")[1]), "ic": v} for k, v in decay.items()]
-    write_table(con, "ic_decay", pd.DataFrame(decay_rows).sort_values("lag"))
+    decay_rows = [{"freq": freq, "lag": 0, "ic": ic_stats["mean_ic"]}]
+    decay_rows += [{"freq": freq, "lag": int(k.split("_")[1]), "ic": v} for k, v in decay.items()]
+    _merge_write_by_freq(con, "ic_decay", pd.DataFrame(decay_rows).sort_values("lag"), freq)
 
-    print(f"Backtest ({freq}): {len(scores_df)} rebalances")
-    print(f"IC summary: {ic_stats}")
-    print(f"IC decay: {decay}")
-    if "spread" in qr:
-        print(f"Q5-Q1 mean: {qr['spread'].mean():.4f}  (n={qr['spread'].notna().sum()})")
+    # Normalization fallback %, by date and sleeve (the screen already prints
+    # this for the latest date; the backtest now persists it for every date).
+    fb_rows = [{"freq": freq, "date": dt, "sleeve": sleeve, "level": level, "pct": pct}
+               for dt, sleeves in fallback_hist.items()
+               for sleeve, levels in sleeves.items()
+               for level, pct in levels.items()]
+    _merge_write_by_freq(con, "normalization_fallback", pd.DataFrame(fb_rows), freq)
+
+    # --- Turnover, net-of-cost, RF-Sharpe, Max Drawdown, persisted as one
+    # summary row per frequency. Turnover is measured on the Q5 (top-quintile)
+    # holdings-weight panel, using the SAME weighting scheme as the quintile
+    # returns above, so turnover and the returns it costs are consistent.
+    spread = qr["spread"] if "spread" in qr else pd.Series(dtype=float)
+    holdings = {}
+    for dt in scores_df.index:
+        s = scores_df.loc[dt].dropna()
+        if len(s) < cfg.portfolio.n_quantiles * 2:
+            continue
+        q5 = assign_quantiles(s, cfg.portfolio.n_quantiles)
+        q5_members = q5[q5 == cfg.portfolio.n_quantiles].index
+        mc = market_cap_df.loc[dt] if dt in market_cap_df.index else None
+        vv = vols_df.loc[dt] if dt in vols_df.index else None
+        holdings[dt] = portfolio_weights(q5_members, method, market_cap=mc, vols=vv)
+    holdings_df = pd.DataFrame(holdings).T.reindex(scores_df.index).fillna(0.0)
+    tn = turnover(holdings_df, ppy=12 if freq == "monthly" else 4)
+
+    ff = get_ff_factors(start=cfg.backtest.start, end=cfg.backtest.end)
+    ff.index = pd.to_datetime(ff.index).to_period("M").to_timestamp("M")
+    spread_idx = spread.index.to_period("M").to_timestamp("M") if len(spread) else spread.index
+    spread_m = pd.Series(spread.values, index=spread_idx)
+    rf = ff["RF"].reindex(spread_m.index)
+
+    ppy = 12 if freq == "monthly" else 4
+    gross_sharpe = sharpe(spread, rf=None, ppy=ppy)  # self-financing -> no Rf
+    q5_returns = qr["Q5"] if "Q5" in qr else pd.Series(dtype=float)
+    if len(q5_returns):
+        q5_idx = q5_returns.index.to_period("M").to_timestamp("M")
+    else:
+        q5_idx = q5_returns.index
+    q5_m = pd.Series(q5_returns.values, index=q5_idx)
+    q5_gross_sharpe = sharpe(q5_m, rf=rf.reindex(q5_m.index), ppy=ppy)
+    mdd = max_drawdown(spread)
+
+    cost_bps = cfg.costs.commission_bps + cfg.costs.spread_bps + cfg.costs.short_rebate_bps
+    net_spread = net_of_cost(spread, tn["per_rebalance_two_way"], cost_bps)
+    net_sharpe = sharpe(net_spread, rf=None, ppy=ppy)
+
+    summary = pd.DataFrame([{
+        "freq": freq, "weighting": method, "n_rebalances": len(scores_df),
+        "gross_spread_mean": float(spread.mean()) if len(spread) else float("nan"),
+        "net_spread_mean": float(net_spread.mean()) if len(net_spread) else float("nan"),
+        "gross_sharpe": gross_sharpe, "net_sharpe": net_sharpe,
+        "q5_gross_sharpe": q5_gross_sharpe, "max_drawdown": mdd,
+        "turnover_per_rebalance": tn["per_rebalance_two_way"],
+        "turnover_annualized": tn["annualized_two_way"],
+        "mean_ic": ic_stats["mean_ic"], "ic_t_stat_hac": ic_stats["t_stat_hac"],
+    }])
+    _merge_write_by_freq(con, "backtest_summary", summary, freq)
+
+    print(f"[{freq}] {len(scores_df)} rebalances, weighting={method}")
+    print(f"[{freq}] IC summary: {ic_stats}")
+    print(f"[{freq}] IC decay: {decay}")
+    if len(spread):
+        print(f"[{freq}] Q5-Q1 gross spread mean: {spread.mean():.4f}  "
+              f"net: {net_spread.mean():.4f}  (n={spread.notna().sum()})")
+    print(f"[{freq}] Sharpe: gross={gross_sharpe:.2f}  net={net_sharpe:.2f}  "
+          f"Q5(excess)={q5_gross_sharpe:.2f}  MaxDrawdown={mdd:.2%}")
+    print(f"[{freq}] Turnover: {tn['per_rebalance_two_way']:.2%}/rebalance, "
+          f"{tn['annualized_two_way']:.2%} annualized")
 
 
-def cmd_decompose(cfg: Config, con) -> None:
+def cmd_decompose(cfg: Config, con, freq: str = "monthly") -> None:
     bt = None
     if _table_exists(con, "backtest_quintiles"):
         bt = con.execute('SELECT * FROM "backtest_quintiles"').df()
     if bt is None or bt.empty:
         print("Run `python run.py backtest` first — no backtest_quintiles table found.")
         return
+    if "freq" in bt.columns:
+        bt = bt[bt["freq"] == freq]
+        if bt.empty:
+            print(f"No backtest_quintiles rows for freq={freq!r} — "
+                  f"run `python run.py backtest --freq {freq}` first.")
+            return
     piv = bt.pivot_table(index="date", columns="quantile", values="ret")
     spread = piv[piv.columns.max()] - piv[piv.columns.min()]
     spread.index = pd.to_datetime(spread.index)
 
     ff = get_ff_factors(start=cfg.backtest.start, end=cfg.backtest.end)
-    ff.index = pd.to_datetime(ff.index).to_period("M").to_timestamp("M")
-    spread.index = spread.index.to_period("M").to_timestamp("M")
+    ann = 12 if freq == "monthly" else 4
+    period = "M" if freq == "monthly" else "Q"
+    ff.index = pd.to_datetime(ff.index).to_period(period).to_timestamp(period)
+    spread.index = spread.index.to_period(period).to_timestamp(period)
+    if freq != "monthly":  # FF factors are monthly; resample to the backtest's own frequency
+        ff = ff.resample("QE").apply(lambda x: (1 + x).prod() - 1)
 
-    result = ff_decompose(spread, ff, is_long_short=True)
-    rows = [{"metric": "alpha_monthly", "value": result["alpha_monthly"]},
-            {"metric": "alpha_annualized", "value": result["alpha_annualized"]},
-            {"metric": "alpha_t_nw", "value": result["alpha_t_nw"]},
-            {"metric": "r_squared", "value": result["r_squared"]},
-            {"metric": "n", "value": result["n"]}]
-    rows += [{"metric": f"{k}_loading", "value": v} for k, v in result["loadings"].items()]
-    write_table(con, "ff_decomposition", pd.DataFrame(rows))
-    print(f"FF5+UMD decomposition of Q5-Q1 (n={result['n']}):")
+    result = ff_decompose(spread, ff, is_long_short=True, ppy=ann)
+    rows = [{"freq": freq, "metric": "alpha_period", "value": result["alpha_monthly"]},
+            {"freq": freq, "metric": "alpha_annualized", "value": result["alpha_annualized"]},
+            {"freq": freq, "metric": "alpha_t_nw", "value": result["alpha_t_nw"]},
+            {"freq": freq, "metric": "r_squared", "value": result["r_squared"]},
+            {"freq": freq, "metric": "n", "value": result["n"]}]
+    rows += [{"freq": freq, "metric": f"{k}_loading", "value": v}
+              for k, v in result["loadings"].items()]
+    _merge_write_by_freq(con, "ff_decomposition", pd.DataFrame(rows), freq)
+    print(f"[{freq}] FF5+UMD decomposition of Q5-Q1 (n={result['n']}):")
     print(f"  alpha (annualized) = {result['alpha_annualized']:.4f}  "
           f"(NW t = {result['alpha_t_nw']:.2f})")
     print(f"  R^2 = {result['r_squared']:.3f}")
@@ -432,6 +580,21 @@ def _table_exists(con, name: str) -> bool:
         return False
 
 
+def _merge_write_by_freq(con, table: str, new_df: pd.DataFrame, freq: str) -> None:
+    """Write ``new_df`` to ``table``, replacing only rows for ``freq`` and
+    preserving any other frequency's previously-written rows — so running
+    `backtest --freq monthly` then `--freq quarterly` doesn't clobber the
+    first run (closes the old CREATE-OR-REPLACE-per-call clobbering bug)."""
+    if _table_exists(con, table):
+        existing = con.execute(f'SELECT * FROM "{table}"').df()
+        if "freq" in existing.columns:
+            existing = existing[existing["freq"] != freq]
+        combined = pd.concat([existing, new_df], ignore_index=True) if len(existing) else new_df
+    else:
+        combined = new_df
+    write_table(con, table, combined)
+
+
 def cmd_export(cfg: Config, con) -> None:
     written = export_for_dashboard(con, cfg.output.export_dir)
     print(f"Exported {len(written)} tables to {cfg.output.export_dir}/: {written}")
@@ -442,7 +605,11 @@ def main() -> None:
     parser.add_argument(
         "command",
         choices=["screen", "backtest", "decompose", "optimize", "multiasset", "dividend", "export"])
-    parser.add_argument("--freq", choices=["monthly", "quarterly"], default="monthly")
+    parser.add_argument(
+        "--freq", choices=["monthly", "quarterly"], default=None,
+        help="backtest/decompose: restrict to one frequency. Omitted for `backtest` -> runs "
+             "every frequency in config's backtest.frequencies_to_test; omitted for `decompose` "
+             "-> defaults to monthly.")
     parser.add_argument("--max-names", type=int, default=None,
                         help="cap universe size (FMP free tier: ~250 calls/day, 4 per name)")
     parser.add_argument("--tickers", default=None,
@@ -459,7 +626,7 @@ def main() -> None:
     elif args.command == "backtest":
         cmd_backtest(cfg, con, args.freq, args.max_names)
     elif args.command == "decompose":
-        cmd_decompose(cfg, con)
+        cmd_decompose(cfg, con, args.freq or "monthly")
     elif args.command == "optimize":
         cmd_optimize(cfg, con)
     elif args.command == "multiasset":

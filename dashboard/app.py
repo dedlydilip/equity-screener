@@ -42,6 +42,8 @@ st.caption("Value / Quality / Momentum · MAD sector-neutral z · FF5+UMD-valida
 
 screen = load("screen")
 bt = load("backtest_quintiles")
+summary = load("backtest_summary")
+fallback = load("normalization_fallback")
 ffd = load("ff_decomposition")
 uni = load("universe")
 panel = load("factor_panel")
@@ -58,6 +60,15 @@ if screen is None:
     st.warning("No outputs yet. Build them first: `python run.py screen`, "
                "then `backtest` / `decompose`.")
     st.stop()
+
+# backtest_quintiles/ff_decomposition/etc. can hold rows for more than one
+# rebalance frequency at once (Stage 3's merge-by-freq write) -> one selector,
+# shared by the Backtest and Factor decomposition tabs below.
+has_freq = bt is not None and "freq" in bt.columns
+# .dropna() defends against stray legacy rows written before the `freq`
+# column existed (mixing real freq strings with NaN would crash sorted()).
+freq_options = sorted(bt["freq"].dropna().unique().tolist()) if has_freq else []
+chosen_freq = st.sidebar.selectbox("Backtest frequency", freq_options) if freq_options else None
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
     ["Screen", "Backtest", "Factor decomposition", "Portfolio / CAPM",
@@ -153,37 +164,75 @@ with tab1:
         st.altair_chart(heat, use_container_width=True)
 
 with tab2:
-    if bt is None:
+    if bt is None or chosen_freq is None:
         st.info("No backtest output yet — run `python run.py backtest`.")
     else:
-        st.subheader("Quintile backtest")
-        piv = bt.pivot_table(index="date", columns="quantile", values="ret").sort_index()
+        bt_f = bt[bt["freq"] == chosen_freq] if "freq" in bt.columns else bt
+        st.subheader(f"Quintile backtest ({chosen_freq})")
+        piv = bt_f.pivot_table(index="date", columns="quantile", values="ret").sort_index()
         cum = (1 + piv).cumprod()
         cum.columns = [f"Q{int(c)}" for c in cum.columns]
         st.line_chart(cum)
-        spread = piv[piv.columns.max()] - piv[piv.columns.min()]
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Q5−Q1 (mean, monthly)", f"{spread.mean() * 100:.2f}%")
-        c2.metric("Q5−Q1 Sharpe", f"{sharpe(spread):.2f}")
-        c3.metric("Q5−Q1 Max Drawdown", f"{max_drawdown(spread) * 100:.1f}%")
+
+        sm = summary[summary["freq"] == chosen_freq] if summary is not None else None
+        if sm is not None and len(sm):
+            row = sm.iloc[0]
+            st.caption(f"Weighting inside each quintile: **{row.get('weighting', 'equal')}**")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Q5−Q1 gross / net", f"{row['gross_spread_mean'] * 100:.2f}% / "
+                     f"{row['net_spread_mean'] * 100:.2f}%")
+            c2.metric("Sharpe gross / net", f"{row['gross_sharpe']:.2f} / {row['net_sharpe']:.2f}")
+            c3.metric("Max Drawdown", f"{row['max_drawdown'] * 100:.1f}%")
+            c4.metric("Turnover (ann.)", f"{row['turnover_annualized'] * 100:.0f}%")
+            st.caption(f"Net figures subtract transaction costs (commission + spread + "
+                      f"short rebate) scaled by realized turnover — net is always ≤ "
+                      f"gross. Mean IC = {row['mean_ic']:.4f} "
+                      f"(Newey-West t = {row['ic_t_stat_hac']:.2f}).")
+        else:
+            # Fall back to a quick recompute if backtest_summary hasn't been exported yet
+            spread = piv[piv.columns.max()] - piv[piv.columns.min()]
+            c1, c2, c3 = st.columns(3)
+            c1.metric(f"Q5−Q1 (mean, {chosen_freq})", f"{spread.mean() * 100:.2f}%")
+            c2.metric("Q5−Q1 Sharpe (gross)", f"{sharpe(spread):.2f}")
+            c3.metric("Q5−Q1 Max Drawdown", f"{max_drawdown(spread) * 100:.1f}%")
 
         if decay is not None:
+            decay_f = decay[decay["freq"] == chosen_freq] if "freq" in decay.columns else decay
             st.subheader("IC decay")
             st.caption("Mean Information Coefficient at increasing forward lags — how fast "
                        "the signal's predictive power fades.")
-            decay_chart = alt.Chart(decay).mark_line(point=True).encode(
+            decay_chart = alt.Chart(decay_f).mark_line(point=True).encode(
                 x=alt.X("lag:O", title="Lag (rebalances ahead)"),
                 y=alt.Y("ic:Q", title="Mean IC"),
                 tooltip=["lag", alt.Tooltip("ic:Q", format=".4f")],
             )
             st.altair_chart(decay_chart, use_container_width=True)
 
+        if fallback is not None:
+            has_fb_freq = "freq" in fallback.columns
+            fb_f = fallback[fallback["freq"] == chosen_freq] if has_fb_freq else fallback
+            st.subheader("Sector-neutral normalization fallback (mean % across the backtest)")
+            st.caption("Which hierarchy level each sleeve typically resolved at — industry group "
+                      "(finest, most neutral), sector, or cross-sectional (last resort).")
+            fb_avg = fb_f.groupby(["sleeve", "level"], as_index=False)["pct"].mean()
+            fb_chart = alt.Chart(fb_avg).mark_bar().encode(
+                x=alt.X("pct:Q", title="Mean % of names resolved at this level"),
+                y=alt.Y("sleeve:N", title=None),
+                color=alt.Color("level:N", title="Hierarchy level"),
+                tooltip=["sleeve", "level", alt.Tooltip("pct:Q", format=".1f")],
+            )
+            st.altair_chart(fb_chart, use_container_width=True)
+
 with tab3:
-    if ffd is None:
+    ffd_f = (ffd[ffd["freq"] == chosen_freq] if ffd is not None and "freq" in ffd.columns
+             and chosen_freq is not None else ffd)
+    if ffd_f is None or not len(ffd_f):
         st.info("No decomposition yet — run `python run.py decompose`.")
     else:
-        st.subheader("Fama-French 5 + Momentum decomposition (Q5−Q1 spread, self-financing)")
-        st.dataframe(ffd, use_container_width=True, hide_index=True)
+        st.subheader(f"Fama-French 5 + Momentum decomposition ({chosen_freq or ''} Q5−Q1 "
+                     f"spread, self-financing)")
+        st.dataframe(ffd_f.drop(columns=["freq"], errors="ignore"),
+                     use_container_width=True, hide_index=True)
         st.caption("Positive alpha after FF5 + UMD ⇒ a premium not explained by the known factors.")
 
 with tab4:
