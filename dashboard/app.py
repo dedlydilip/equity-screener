@@ -287,25 +287,31 @@ with tab6:
         st.info("No dividend screen yet — run `python run.py dividend`.")
     else:
         st.subheader("Dividend-income screen")
-        st.caption("Ranked by trailing-12m dividend yield, gated on payout sustainability "
-                   "(dividends / earnings) — a high yield funded by ~all of earnings is a cut "
-                   "waiting to happen, so those are dropped.")
+        st.caption("Ranked by RECURRING (regular) trailing-12m dividend yield — special/variable "
+                   "payouts (e.g. a one-off large annual dividend) are excluded from the ranking "
+                   "yield but shown in the total, flagged via 'has_special_dividend'. Gated on "
+                   "payout sustainability (total dividends / earnings) — a high yield funded by "
+                   "~all of earnings is a cut waiting to happen, so those are dropped.")
         show = div_screen.copy()
-        show["dividend_yield"] = (show["dividend_yield"] * 100).round(2)
+        show["regular_dividend_yield"] = (show["regular_dividend_yield"] * 100).round(2)
+        show["total_dividend_yield"] = (show["total_dividend_yield"] * 100).round(2)
         show["payout_ratio"] = (show["payout_ratio"] * 100).round(0)
-        cols = ["rank", "ticker", "dividend_yield", "payout_ratio", "sector", "weight"]
+        cols = ["rank", "ticker", "regular_dividend_yield", "total_dividend_yield",
+                "has_special_dividend", "payout_ratio", "sector", "weight"]
         st.dataframe(show[[c for c in cols if c in show.columns]],
                      use_container_width=True, hide_index=True)
 
         st.subheader("Yield vs. payout ratio")
-        st.caption("Top-right = high yield but stretched payout (riskier); "
+        st.caption("Top-right = high recurring yield but stretched payout (riskier); "
                    "left = safer coverage. The gate already removed payout > ceiling.")
         scatter = alt.Chart(div_screen).mark_circle(size=90, opacity=0.7).encode(
             x=alt.X("payout_ratio:Q", title="Payout ratio", axis=alt.Axis(format="%")),
-            y=alt.Y("dividend_yield:Q", title="Dividend yield", axis=alt.Axis(format="%")),
+            y=alt.Y("regular_dividend_yield:Q", title="Regular dividend yield",
+                    axis=alt.Axis(format="%")),
             color=alt.Color("sector:N", title="Sector") if "sector" in div_screen.columns
             else alt.value("#2a9d8f"),
-            tooltip=["ticker", alt.Tooltip("dividend_yield:Q", format=".2%"),
+            tooltip=["ticker", alt.Tooltip("regular_dividend_yield:Q", format=".2%"),
+                     alt.Tooltip("total_dividend_yield:Q", format=".2%"),
                      alt.Tooltip("payout_ratio:Q", format=".0%")],
         )
         st.altair_chart(scatter, use_container_width=True)

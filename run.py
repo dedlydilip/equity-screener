@@ -41,6 +41,7 @@ from screener.optimize import (
     min_variance_weights,
     portfolio_stats,
 )
+from screener.pit_membership import all_time_tickers, constituents_as_of, get_sp500_changes
 from screener.portfolio import concentration
 from screener.portfolio import weights as portfolio_weights
 from screener.report import export_for_dashboard
@@ -60,12 +61,19 @@ def _month_ends(start: str, end: str, freq: str) -> pd.DatetimeIndex:
     return pd.date_range(start, end, freq=rule)
 
 
-def _load_universe_and_data(cfg: Config, max_names=None, start=None, end=None, only=None):
+def _load_universe_and_data(
+    cfg: Config, max_names=None, start=None, end=None, only=None, extra_tickers=None
+):
     """Load universe, point-in-time fundamentals, and adjusted prices.
 
     Fails CLOSED: a factor screen/backtest is meaningless without point-in-time
     fundamentals, so a provider that cannot supply them (or supplies none) aborts
     the run rather than silently continuing on an empty frame.
+
+    ``extra_tickers`` (optional) are pulled alongside the current constituent
+    list without being added to ``uni``'s metadata — used by the backtest to
+    fetch data for historically-removed S&P 500 names so point-in-time
+    membership can be applied per rebalance date (see pit_membership.py).
     """
     start = start or cfg.backtest.start
     end = end or cfg.backtest.end
@@ -75,6 +83,9 @@ def _load_universe_and_data(cfg: Config, max_names=None, start=None, end=None, o
     if max_names:
         uni = uni.head(max_names)  # bound the universe to stay under FMP free-tier daily call cap
     tickers = uni["ticker"].tolist()
+    if extra_tickers:
+        seen = set(tickers)
+        tickers = tickers + [t for t in extra_tickers if t not in seen]
     provider = _make_provider(cfg)
     try:
         fund = provider.get_fundamentals(tickers)
@@ -103,8 +114,8 @@ def _composite_at(fund, prices, uni, cfg: Config, as_of, sleeve_weights: dict[st
     kept (not just folded into the composite) so callers can persist factor
     *attribution*: which sleeve drove a name's rank, not just its final score.
     """
-    raw = compute_factors(fund, prices, as_of, cfg.quality_gates)
     uni_idx = uni.set_index("ticker")
+    raw = compute_factors(fund, prices, as_of, cfg.quality_gates, sector=uni_idx["sector"])
     z_by_sleeve = {}
     fallback_pct = {}
     for sleeve, cols in SLEEVES.items():
@@ -164,7 +175,22 @@ def cmd_screen(cfg: Config, con, max_names=None, only=None) -> None:
 
 
 def cmd_backtest(cfg: Config, con, freq: str, max_names=None) -> None:
-    uni, fund, prices = _load_universe_and_data(cfg, max_names)
+    # Point-in-time membership: reconstruct historical S&P 500 constituents
+    # (Wikipedia's changes table) so each rebalance only scores/holds names
+    # that were ACTUALLY index members on that date, mitigating (not fully
+    # eliminating -- see pit_membership.py) survivorship bias. This requires
+    # pulling data for some names no longer in today's list.
+    current = get_sp500()
+    if max_names:
+        current = current.head(max_names)
+    current_tickers = set(current["ticker"])
+    changes = get_sp500_changes()
+    extra = sorted(all_time_tickers(current_tickers, changes, since=cfg.backtest.start)
+                    - current_tickers)
+    print(f"Point-in-time membership: {len(current_tickers)} current constituents + "
+          f"{len(extra)} historically-removed/renamed names pulled for the {cfg.backtest.start}"
+          f"..{cfg.backtest.end} window (some may lack EDGAR/yfinance data post-delisting).")
+    uni, fund, prices = _load_universe_and_data(cfg, max_names, extra_tickers=extra)
     dates = _month_ends(cfg.backtest.start, cfg.backtest.end, freq)
     dates = [d for d in dates if d <= prices.index.max()] if not prices.empty else []
     if len(dates) < 3:
@@ -175,6 +201,8 @@ def cmd_backtest(cfg: Config, con, freq: str, max_names=None) -> None:
     scores, fwd_returns = {}, {}
     for i, dt in enumerate(dates[:-1]):
         _, comp, _, _ = _composite_at(fund, prices, uni, cfg, dt, equal_w)
+        members = constituents_as_of(dt, current_tickers, changes)
+        comp = comp.reindex(comp.index.intersection(members))
         scores[dt] = comp
         px_now = prices[prices.index <= dt].iloc[-1] if (prices.index <= dt).any() else None
         nxt = dates[i + 1]
@@ -366,23 +394,33 @@ def cmd_dividend(cfg: Config, con, max_names=None) -> None:
         list(tickers), as_of=as_of).set_index("ticker")
 
     dividends_ttm = divs["dividends_ttm"].reindex(tickers)
-    shares = pit.loc[tickers, "shares_diluted"]
+    regular_dividends_ttm = divs["regular_dividends_ttm"].reindex(tickers)
+    # Actual shares outstanding receive the cash dividend; the diluted
+    # weighted-average (which includes hypothetical option/RSU dilution) would
+    # overstate total cash paid. Same dated-figure-with-fallback as market cap.
+    shares = pit.loc[tickers, "shares_outstanding"].where(
+        pit.loc[tickers, "shares_outstanding"] > 0, pit.loc[tickers, "shares_diluted"])
     net_income = pit.loc[tickers, "net_income_ttm"]
     sector = uni.set_index("ticker")["sector"].reindex(tickers)
 
     screen = build_dividend_screen(
-        dividends_ttm, price.loc[tickers], shares, net_income, sector=sector,
+        dividends_ttm, price.loc[tickers], shares, net_income,
+        regular_dividends_ttm=regular_dividends_ttm, sector=sector,
         min_yield=cfg.dividend.min_yield, max_payout=cfg.dividend.max_payout,
         top_n=cfg.dividend.top_n)
     screen.insert(0, "as_of", as_of)
     write_table(con, "dividend_screen", screen)
 
     print(f"Dividend screen as of {as_of.date()}: {len(screen)} names "
-          f"(payout <= {cfg.dividend.max_payout:.0%}, ranked by yield)")
+          f"(payout <= {cfg.dividend.max_payout:.0%}, ranked by RECURRING yield)")
     show = screen.head(15).copy()
-    show["dividend_yield"] = (show["dividend_yield"] * 100).round(2).astype(str) + "%"
+    reg_pct = (show["regular_dividend_yield"] * 100).round(2).astype(str)
+    tot_pct = (show["total_dividend_yield"] * 100).round(2).astype(str)
+    show["regular_dividend_yield"] = reg_pct + "%"
+    show["total_dividend_yield"] = tot_pct + "%"
     show["payout_ratio"] = (show["payout_ratio"] * 100).round(0).astype(str) + "%"
-    cols = ["rank", "ticker", "dividend_yield", "payout_ratio", "sector"]
+    cols = ["rank", "ticker", "regular_dividend_yield", "total_dividend_yield",
+            "has_special_dividend", "payout_ratio", "sector"]
     print(show[cols].to_string(index=False))
 
 

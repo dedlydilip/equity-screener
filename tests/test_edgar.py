@@ -50,3 +50,22 @@ def test_original_filing_wins_over_later_restatement(tmp_path):
     ]
     out = prov._quarterly_flow(pts)
     assert out[pd.Timestamp("2023-03-31")] == (100, pd.Timestamp("2023-04-30"))
+    # NOTE: this is a deliberate PiT choice, not an oversight (see docstring on
+    # _quarterly_flow / plan Stage 2 M5) — an investor trading between the two
+    # filing dates only ever saw the as-first-reported 100, so using it (dated to
+    # its original filing) avoids leaking a later data revision into the past.
+    # The live/current screen re-pulling EDGAR after 2024-01-15 would naturally
+    # pick up 105 for a NEW as_of, since a fresh companyfacts call is uncached.
+
+
+def test_shares_outstanding_keyed_by_filing_not_period_end(tmp_path):
+    """dei:EntityCommonStockSharesOutstanding is a cover-page 'as of' fact whose
+    own date does NOT line up with the 10-Q's period end -> it must be matched to
+    a row by the filing date it was disclosed alongside, not by its own 'end'."""
+    prov = EdgarProvider(cache_dir=str(tmp_path))
+    # cover-page date (2023-04-25) sits between the quarter end (2023-03-31) and
+    # the filing date (2023-04-30) -- neither of which it equals.
+    pts = [{"form": "10-Q", "end": "2023-04-25", "filed": "2023-04-30", "val": 1_000_000}]
+    out = prov._shares_outstanding_by_filing(pts)
+    assert out[pd.Timestamp("2023-04-30")] == 1_000_000
+    assert pd.Timestamp("2023-04-25") not in out

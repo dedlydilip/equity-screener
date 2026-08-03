@@ -11,6 +11,14 @@ year-to-date; we take the direct ~3-month values and reconstruct Q4 from the
 instantaneous levels. EBITDA, free cash flow, and total debt are derived from
 their components; anything unavailable is left NaN (the quality gate handles it).
 
+Restatements (deliberate design choice, not a gap): when the same period is
+disclosed in more than one filing (e.g. a later 10-K restates a prior quarter's
+comparatives), the EARLIEST filing is kept, not the latest. This is the
+as-originally-reported figure — the number an investor actually saw at the
+time — which is the standard point-in-time convention (mirrors how CRSP/
+Compustat PiT datasets default). It also means a restatement's correction
+never leaks into the backtest, avoiding any hint of hindsight bias.
+
 EDGAR has no prices, so ``get_prices`` delegates to the (also free, adjusted)
 yfinance provider.
 """
@@ -57,6 +65,9 @@ _STOCK = {
     "short_term_debt": ["DebtCurrent", "LongTermDebtCurrent"],
     "shares_diluted": ["WeightedAverageNumberOfDilutedSharesOutstanding"],
 }
+# dei: (not us-gaap:) cover-page fact -> dated shares outstanding, see
+# _shares_outstanding_by_filing.
+_DEI_SHARES_TAGS = ["EntityCommonStockSharesOutstanding"]
 
 
 class EdgarProvider(DataProvider):
@@ -88,15 +99,35 @@ class EdgarProvider(DataProvider):
         return self._cik
 
     @staticmethod
-    def _usd_points(facts: dict, tags: list[str]) -> list[dict]:
-        gaap = facts.get("facts", {}).get("us-gaap", {})
+    def _usd_points(facts: dict, tags: list[str], namespace: str = "us-gaap") -> list[dict]:
+        ns = facts.get("facts", {}).get(namespace, {})
         for tag in tags:
-            if tag in gaap:
-                units = gaap[tag].get("units", {})
+            if tag in ns:
+                units = ns[tag].get("units", {})
                 for unit_key in ("USD", "USD/shares", "shares"):
                     if unit_key in units:
                         return units[unit_key]
         return []
+
+    @staticmethod
+    def _shares_outstanding_by_filing(points: list[dict]) -> dict[pd.Timestamp, float]:
+        """Dated shares outstanding, keyed by filing date.
+
+        ``dei:EntityCommonStockSharesOutstanding`` is a cover-page fact "as of" a
+        date close to (not equal to) the filing — unlike the balance-sheet items,
+        its own ``end`` date won't line up with the 10-Q/10-K period end, so it
+        can't be joined the same way. Every 10-Q/10-K cover page carries one, so
+        it's matched to a row by that filing's ``filed`` date instead: the market
+        cap as of a filing should use the share count *disclosed in that filing*,
+        not a stale trailing average.
+        """
+        out: dict[pd.Timestamp, float] = {}
+        for p in points:
+            if p.get("form") not in ("10-Q", "10-K") or "val" not in p:
+                continue
+            filed = pd.Timestamp(p["filed"])
+            out[filed] = float(p["val"])
+        return out
 
     @staticmethod
     def _dur_days(p: dict) -> int | None:
@@ -122,7 +153,7 @@ class EdgarProvider(DataProvider):
             filed = pd.Timestamp(p["filed"])
             val = float(p["val"])
             if 80 <= self._dur_days(p) <= 100 and (end not in out or filed < out[end][1]):
-                out[end] = (val, filed)  # direct quarterly (earliest filing = original)
+                out[end] = (val, filed)  # earliest filing kept -> see module docstring
             by_start.setdefault(start, []).append((end, val, filed))
 
         for start, ladder in by_start.items():
@@ -157,15 +188,19 @@ class EdgarProvider(DataProvider):
         for field, tags in _STOCK.items():
             lvl = self._stock_level(self._usd_points(facts, tags))
             series[field] = {end: v for end, (v, _f) in lvl.items()}
+        shares_by_filing = self._shares_outstanding_by_filing(
+            self._usd_points(facts, _DEI_SHARES_TAGS, namespace="dei"))
 
         ends = sorted(e for e in filed_by_end)  # period ends anchored to the income statement
         if not ends:
             return pd.DataFrame()
         rows = []
         for end in ends:
-            row = {"ticker": ticker, "period_end": end, "filing_date": filed_by_end[end]}
+            filed = filed_by_end[end]
+            row = {"ticker": ticker, "period_end": end, "filing_date": filed}
             for field in {**_FLOW, **_STOCK}:
                 row[field] = series[field].get(end, float("nan"))
+            row["shares_outstanding"] = shares_by_filing.get(filed, float("nan"))
             rows.append(row)
         df = pd.DataFrame(rows)
 

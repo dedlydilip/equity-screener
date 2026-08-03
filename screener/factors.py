@@ -20,7 +20,11 @@ from .data.quality import mask_negative_denominator, winsorize_cross_sectional
 
 FLOW = ["revenue", "gross_profit", "operating_income", "pretax_income", "tax_expense",
         "net_income", "ebitda", "free_cash_flow"]
-STOCK = ["book_equity", "total_debt", "cash", "total_assets", "shares_diluted"]
+STOCK = ["book_equity", "total_debt", "cash", "total_assets", "shares_diluted",
+         "shares_outstanding"]
+# GICS sectors whose balance sheets make EV/EBITDA, Debt/Equity and generic-ROIC
+# meaningless (debt is raw material, not leverage) -> those factors are NaN'd.
+_FINANCIAL_SECTORS = {"Financials"}
 FACTORS = ["ep", "bp", "fcf_yield", "ev_ebitda_inv", "roe", "roic", "gross_profitability",
            "de_inv", "momentum"]
 SLEEVES = {
@@ -41,7 +45,14 @@ def pit_fundamentals(fund: pd.DataFrame, as_of) -> pd.DataFrame:
     out = {}
     for tkr, g in known.groupby("ticker"):
         last4 = g.tail(4)
-        rec = {f"{c}_ttm": last4[c].sum(min_count=1) for c in FLOW if c in g}
+        # A TTM figure requires four *consecutive* quarters (~91 days apart). A
+        # partial history (a newly covered issuer) or a gap would otherwise
+        # masquerade as a full year, so flow items are NaN'd unless the window
+        # is genuinely four contiguous quarters.
+        gaps = pd.to_datetime(last4["period_end"]).diff().dropna().dt.days
+        ttm_ok = len(last4) == 4 and bool(gaps.between(70, 100).all())
+        rec = {f"{c}_ttm": (last4[c].sum(min_count=4) if ttm_ok else float("nan"))
+               for c in FLOW if c in g}
         latest = g.iloc[-1]
         rec.update({c: latest[c] for c in STOCK if c in g})
         out[tkr] = rec
@@ -64,8 +75,17 @@ def momentum_12_1(prices: pd.DataFrame, as_of) -> pd.Series:
     return recent / old - 1.0
 
 
-def compute_factors(fund: pd.DataFrame, prices: pd.DataFrame, as_of, gates) -> pd.DataFrame:
-    """Cross-sectional raw factors (ticker x factor) as of ``as_of``."""
+def compute_factors(
+    fund: pd.DataFrame, prices: pd.DataFrame, as_of, gates, sector: pd.Series | None = None
+) -> pd.DataFrame:
+    """Cross-sectional raw factors (ticker x factor) as of ``as_of``.
+
+    ``sector`` (ticker -> GICS sector, optional) masks EV/EBITDA, D/E and generic
+    ROIC to NaN for Financials: a bank's or insurer's debt is raw material for its
+    business, not leverage, so treating it like an industrial's balance sheet
+    would rank the most-levered (i.e. largest) banks as the worst-quality names.
+    If omitted, no sector masking is applied (e.g. for unit tests with no universe).
+    """
     pit = pit_fundamentals(fund, as_of)
     price = price_asof(prices, as_of)
     tickers = pit.index.intersection(price.index)
@@ -77,7 +97,13 @@ def compute_factors(fund: pd.DataFrame, prices: pd.DataFrame, as_of, gates) -> p
     fcf, opinc = g["free_cash_flow_ttm"], g["operating_income_ttm"]
     pretax, tax = g["pretax_income_ttm"], g["tax_expense_ttm"]
     book, debt, cash = g["book_equity"], g["total_debt"], g["cash"]
-    assets, shares = g["total_assets"], g["shares_diluted"]
+    assets = g["total_assets"]
+    # Market cap should use POINT-IN-TIME shares outstanding (the dei cover-page
+    # fact, dated to the filing), not the weighted-average diluted share count
+    # used to compute EPS over a quarter — the latter is a flow-period average,
+    # not a balance-sheet-date snapshot, and distorts every price-based ratio.
+    # Fall back to diluted shares only where the dated figure is unavailable.
+    shares = g["shares_outstanding"].where(g["shares_outstanding"] > 0, g["shares_diluted"])
 
     mcap = price * shares
     etr = (tax / pretax).where(pretax > 0).clip(0, 0.5).fillna(0.21)
@@ -110,6 +136,11 @@ def compute_factors(fund: pd.DataFrame, prices: pd.DataFrame, as_of, gates) -> p
     # Winsorize each factor cross-sectionally (tame extremes pre-normalization)
     for c in FACTORS:
         f[c] = winsorize_cross_sectional(f[c], gates.xs_mad_flag)
+
+    if sector is not None:
+        is_financial = sector.reindex(tickers).isin(_FINANCIAL_SECTORS)
+        for c in ("ev_ebitda_inv", "de_inv", "roic"):
+            f[c] = f[c].where(~is_financial)
 
     f["market_cap"] = mcap
     return f

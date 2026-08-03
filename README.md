@@ -15,9 +15,15 @@ explained by a known factor?" This project is built to institutional standards i
 
 - **Fundamental look-ahead controlled.** Fundamentals are gated by their SEC **filing date** (the
   XBRL `filed` timestamp), *strictly before* the rebalance date — a Q1 number isn't usable until it
-  was actually filed. Two **residual** look-aheads are known and disclosed, not hidden: the universe
-  uses **current** S&P 500 membership and **current** GICS classification applied to all history
-  (survivorship + classification bias). See Limitations.
+  was actually filed.
+- **Point-in-time constituent membership (backtest).** Historical S&P 500 membership is reconstructed
+  from Wikipedia's dated changes table, so each monthly rebalance only scores/holds names that were
+  *actually* index members on that date — not today's list applied retroactively. This mitigates, but
+  doesn't fully eliminate, survivorship bias: a removed/acquired constituent's data is only recoverable
+  if it's still an SEC filer and yfinance still serves its pre-delisting prices, which isn't always
+  true. One **residual** look-ahead remains and is disclosed, not hidden: GICS sector/industry
+  classification is **today's**, applied to all history (no free source provides classification
+  *as of* a historical date). See Limitations.
 - **Sector-neutral, robust normalization.** MAD (median absolute deviation) z-scores, computed
   within a finest-first GICS hierarchy (industry group → sector → cross-sectional), so a screen
   isn't secretly just "buy tech."
@@ -35,6 +41,7 @@ explained by a known factor?" This project is built to institutional standards i
 config.yaml          pre-registered, Pydantic-validated run configuration
 screener/
   universe.py         S&P 500 constituents + GICS sector / industry-group classification
+  pit_membership.py   point-in-time historical constituent reconstruction (backtest only)
   data/
     edgar.py          SEC EDGAR XBRL point-in-time fundamentals (default; free, full history)
     fmp.py            alternative point-in-time fundamentals provider (FMP /stable API)
@@ -101,11 +108,13 @@ equities (SPY), bonds (AGG/TLT/IEF/LQD/HYG/TIP), and commodities (GLD/SLV/USO/DB
 commodities have no equity-style fundamentals and no free per-security data, so they enter here as
 ETF proxies, never through the factor screen.
 
-**Dividend income:** a separate screen ranking on trailing-12-month dividend yield but gated on
-**payout sustainability** (dividends / earnings, from the same EDGAR data) — a high yield funded by
-nearly all of earnings is a cut waiting to happen, so those are dropped. Trailing yield currently
-includes one-off **special/variable** dividends (e.g. Progressive's large annual variable payout),
-which overstate recurring income; separating regular from special dividends is on the Roadmap.
+**Dividend income:** a separate screen ranking on trailing-12-month **recurring (regular)** dividend
+yield but gated on **payout sustainability** (total dividends / earnings, from the same EDGAR data) —
+a high yield funded by nearly all of earnings is a cut waiting to happen, so those are dropped. A
+one-off **special/variable** payment (e.g. Progressive's large annual variable dividend on top of its
+small regular one) is separated from the regular yield via a documented heuristic (a payment > 2x the
+trailing median is "special"), so the headline yield reflects recurring income, not a one-time payout —
+the total (incl. specials) is still reported alongside for context.
 
 ## Roadmap (implemented as tested functions/config, but NOT yet wired into the pipeline)
 
@@ -117,8 +126,6 @@ function level, and wiring them into `run.py`/the backtest is in progress:
   and persisted *inside* the backtest (`validate.turnover/net_of_cost/sharpe/max_drawdown`).
 - **Monthly-vs-quarterly** rebalance comparison in one run.
 - **HAC (Newey-West) IC t-statistic**; per-date fallback-% persistence.
-- **Dated shares-outstanding** for market cap (currently weighted-average diluted shares); strict
-  four-quarter TTM; financial-sector-specific factor handling; effective-dated GICS/index membership.
 - **SQL** surfaced in the dashboard; a reproducibility **manifest**; an analysis **notebook**; a
   built **Power BI `.pbix`**.
 
@@ -135,9 +142,10 @@ Everything runs on **free** sources — no API key required for the default path
 - **Prices:** `yfinance` (`auto_adjust=True`) — split-and-dividend-adjusted total-return closes,
   never raw closes.
 - **Factor returns:** the Ken French Data Library, via `pandas_datareader`.
-- **Universe:** current S&P 500 constituents (Wikipedia). Using today's membership list means the
-  backtest has **survivorship bias on the constituent list** — a documented limitation (fundamental
-  look-ahead is separately eliminated via filing dates).
+- **Universe:** current S&P 500 constituents (Wikipedia) for the live screen; the **backtest**
+  reconstructs point-in-time historical membership from Wikipedia's dated changes table
+  (`screener/pit_membership.py`) so each rebalance only scores names that were actually index members
+  on that date — this mitigates, but doesn't fully eliminate, survivorship bias (see Limitations).
 
 ## Running it
 
@@ -190,21 +198,30 @@ small positive spread, but the alpha is **not statistically distinguishable from
 — the realistic finding that simple composites are largely arbitraged out of large caps, and exactly
 what the decomposition exists to reveal. The genuine strengths on display are the point-in-time
 discipline, the **sector-neutral normalization actually resolving most names within their industry
-group**, and honest reporting rather than an overfit backtest. Natural next steps: point-in-time
-index membership (removes survivorship bias) and inverse-vol sleeve weighting in the composite.
+group**, and honest reporting rather than an overfit backtest. Natural next step: inverse-vol sleeve
+weighting in the composite (point-in-time index membership is now implemented — see Data/Roadmap).
 
 ## Limitations
 
-- **Survivorship on the constituent list** — the screen uses today's S&P 500 membership, not the
-  historical roster at each rebalance date, so delisted/removed names are absent from the backtest.
-- **Classification look-ahead** — GICS sector/industry-group labels are today's, applied to all
-  history, so the sector-neutral normalization uses classifications a historical investor didn't have.
-  Both this and survivorship need effective-dated index membership + classification (Roadmap); until
-  then they are disclosed, not fixed. (Fundamental look-ahead *is* controlled — SEC filing dates,
-  strictly before the trade date.)
-- **Market cap uses weighted-average diluted shares** (the EDGAR income-statement share count), not
-  point-in-time shares outstanding — a modest distortion to every price-based ratio, being replaced
-  with dated `EntityCommonStockSharesOutstanding` (Roadmap).
+- **Survivorship bias is mitigated, not eliminated.** The backtest reconstructs historical S&P 500
+  membership from Wikipedia's changes table (406 change events, 1976–present), so each rebalance
+  correctly excludes not-yet-added names and includes names not-yet-removed. The residual gap: a
+  removed/acquired constituent's fundamentals are only recoverable if it's still an SEC-registered
+  filer (an acquirer that deregistered its target stops appearing in EDGAR's filer list entirely —
+  in a spot-check of 11 historically-removed names, 4 were still recoverable, 7 were not, e.g. Aetna
+  and Alexion post-acquisition), and its price history is only available if yfinance still serves data
+  up to its delisting date, which it often doesn't. So some historically-real constituents are still
+  silently absent — an improvement over using today's list, not a complete fix.
+- **Classification look-ahead (permanent, not fixable for free)** — GICS sector/industry-group labels
+  are today's, applied to all history. No free source maps a company to its GICS sector *as of* a
+  historical date (that mapping is proprietary S&P/Capital IQ or CRSP/Compustat `HGIC` data); only the
+  classification *taxonomy's* evolution is publicly documented, not the company-level assignments. This
+  is disclosed, not a work-in-progress. (Fundamental look-ahead *is* controlled — SEC filing dates,
+  strictly before the trade date — and restatements deliberately use the as-originally-filed figure,
+  never a later correction, avoiding any hindsight leakage; see `data/edgar.py`.)
+- **Market cap uses point-in-time shares outstanding** (EDGAR's `dei:EntityCommonStockSharesOutstanding`
+  cover-page fact, matched to each filing's date), falling back to the weighted-average diluted share
+  count only when that dated figure is unavailable.
 - **The CAPM/optimizer results are in-sample and descriptive** — full-history sample mean/covariance
   over today's screened names; not an out-of-sample tradeable strategy.
 - **EDGAR coverage is best for recent years** — derived quantities (EBITDA, FCF, total debt) depend

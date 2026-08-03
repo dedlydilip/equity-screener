@@ -50,3 +50,27 @@ def test_screen_ranks_by_yield_and_weights_sum_to_one():
     assert out.iloc[0]["ticker"] == "HI"            # highest yield ranks first
     assert out["weight"].sum() == 1.0 or abs(out["weight"].sum() - 1.0) < 1e-9
     assert out.iloc[0]["weight"] > out.iloc[-1]["weight"]  # income-weighted toward higher yield
+
+
+def test_screen_ranks_by_regular_yield_not_inflated_by_a_special_dividend():
+    # PGR-like case: SPECIAL has a huge total (mostly a one-off special payout)
+    # but a tiny recurring yield; REGULAR has a smaller total but ALL of it is
+    # recurring. Ranking on regular yield must put REGULAR first, not SPECIAL.
+    idx = ["SPECIAL", "REGULAR"]
+    total_div = pd.Series({"SPECIAL": 14.0, "REGULAR": 3.0}, index=idx)
+    # SPECIAL's recurring (non-special) slice of its dividends:
+    regular_div = pd.Series({"SPECIAL": 0.4, "REGULAR": 3.0}, index=idx)
+    px = pd.Series({"SPECIAL": 200.0, "REGULAR": 100.0}, index=idx)
+    shares = pd.Series({"SPECIAL": 1.0, "REGULAR": 1.0}, index=idx)
+    ni = pd.Series({"SPECIAL": 100.0, "REGULAR": 100.0}, index=idx)
+
+    out = build_dividend_screen(
+        total_div, px, shares, ni, regular_dividends_ttm=regular_div,
+        min_yield=0.0, max_payout=0.90, top_n=30)
+
+    assert out.iloc[0]["ticker"] == "REGULAR"  # 3% recurring beats SPECIAL's 0.2% recurring
+    special_row = out[out["ticker"] == "SPECIAL"].iloc[0]
+    assert bool(special_row["has_special_dividend"])
+    assert not bool(out[out["ticker"] == "REGULAR"].iloc[0]["has_special_dividend"])
+    # total yield still reflects the full cash paid, even though ranking doesn't
+    assert special_row["total_dividend_yield"] > special_row["regular_dividend_yield"]
