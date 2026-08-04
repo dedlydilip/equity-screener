@@ -11,13 +11,17 @@ import sys
 from pathlib import Path
 
 import altair as alt
+import duckdb
 import pandas as pd
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 OUT = ROOT / "outputs"
+DUCKDB_PATH = OUT / "screener.duckdb"
+QUERIES_SQL = ROOT / "sql" / "queries.sql"
 
+from screener.db import iter_named_queries  # noqa: E402
 from screener.factors import FACTORS  # noqa: E402
 from screener.validate import max_drawdown, sharpe  # noqa: E402
 
@@ -70,9 +74,9 @@ has_freq = bt is not None and "freq" in bt.columns
 freq_options = sorted(bt["freq"].dropna().unique().tolist()) if has_freq else []
 chosen_freq = st.sidebar.selectbox("Backtest frequency", freq_options) if freq_options else None
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
     ["Screen", "Backtest", "Factor decomposition", "Portfolio / CAPM",
-     "Multi-asset", "Dividend income"])
+     "Multi-asset", "Dividend income", "SQL"])
 
 with tab1:
     st.subheader("Ranked screen")
@@ -364,3 +368,27 @@ with tab6:
                      alt.Tooltip("payout_ratio:Q", format=".0%")],
         )
         st.altair_chart(scatter, use_container_width=True)
+
+with tab7:
+    st.subheader("SQL analytics")
+    st.caption("The named queries in `sql/queries.sql`, run live against the DuckDB store "
+               "(`screener.db.query_file`) — the same SQL the pipeline's `python run.py reports` "
+               "prints. This is the analytical layer, not a re-plot of the parquet exports.")
+    if not DUCKDB_PATH.exists():
+        st.info("No DuckDB store yet — run the pipeline (e.g. `python run.py screen`, then "
+                "`backtest` / `decompose`) to create `outputs/screener.duckdb`.")
+    else:
+        con = duckdb.connect(str(DUCKDB_PATH), read_only=True)
+        for name, sql in iter_named_queries(QUERIES_SQL):
+            st.markdown(f"**`{name}`**")
+            st.code(sql, language="sql")
+            try:
+                result = con.execute(sql).df()
+            except duckdb.CatalogException:
+                st.caption("_Skipped — a table this query needs hasn't been built in this run._")
+                continue
+            if result.empty:
+                st.caption("_No rows._")
+            else:
+                st.dataframe(result, use_container_width=True, hide_index=True)
+        con.close()

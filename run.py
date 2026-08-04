@@ -13,6 +13,7 @@ Usage (from the repo root):
     python run.py multiasset             # cross-asset (equity/bond/commodity ETF) allocation
     python run.py dividend               # dividend-income screen (yield + payout sustainability)
     python run.py export                 # write outputs/*.parquet for the dashboard
+    python run.py reports                # run the named SQL analytics in sql/queries.sql
 
 Each subcommand loads ``config.yaml``, does its work, and writes results into
 the DuckDB store at ``output.duckdb_path`` (config-driven, default
@@ -45,7 +46,7 @@ from screener.optimize import (
 from screener.pit_membership import all_time_tickers, constituents_as_of, get_sp500_changes
 from screener.portfolio import assign_quantiles, concentration
 from screener.portfolio import weights as portfolio_weights
-from screener.report import export_for_dashboard
+from screener.report import export_for_dashboard, run_reports
 from screener.screen import apply_hard_filters, build_screen
 from screener.universe import get_sp500
 from screener.validate import (
@@ -600,11 +601,23 @@ def cmd_export(cfg: Config, con) -> None:
     print(f"Exported {len(written)} tables to {cfg.output.export_dir}/: {written}")
 
 
+def cmd_reports(cfg: Config, con) -> None:
+    """Run the named analytical queries in ``sql/queries.sql`` and print each."""
+    reports = run_reports(con)
+    if not reports:
+        print("No query results — build the tables first (`python run.py screen`, `backtest`).")
+        return
+    for name, df in reports.items():
+        print(f"\n=== {name} ({len(df)} rows) ===")
+        print(df.to_string(index=False) if not df.empty else "  (no rows)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=["screen", "backtest", "decompose", "optimize", "multiasset", "dividend", "export"])
+        choices=["screen", "backtest", "decompose", "optimize", "multiasset", "dividend",
+                 "export", "reports"])
     parser.add_argument(
         "--freq", choices=["monthly", "quarterly"], default=None,
         help="backtest/decompose: restrict to one frequency. Omitted for `backtest` -> runs "
@@ -635,6 +648,8 @@ def main() -> None:
         cmd_dividend(cfg, con, args.max_names)
     elif args.command == "export":
         cmd_export(cfg, con)
+    elif args.command == "reports":
+        cmd_reports(cfg, con)
 
 
 if __name__ == "__main__":

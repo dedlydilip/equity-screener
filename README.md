@@ -57,12 +57,13 @@ screener/
   capm.py             per-security CAPM beta / alpha vs. the market (Newey-West)
   optimize.py         long-only mean-variance: max-Sharpe, min-variance, efficient frontier (SLSQP)
   dividend.py         dividend-income screen: trailing yield gated on payout sustainability
-  db.py, report.py    DuckDB analytical store + parquet export for the dashboards
-sql/                  DuckDB analytical queries (sector exposure, quintile returns, ...)
-dashboard/app.py      Streamlit dashboard (primary) — 6 tabs (screen, backtest, decomposition,
-                      portfolio/CAPM, multi-asset, dividend income)
+  db.py, report.py    DuckDB store (typed schema applied on connect) + parquet export + SQL runner
+sql/                  schema.sql (the typed table contract) + queries.sql (named analytical queries)
+dashboard/app.py      Streamlit dashboard (primary) — 7 tabs (screen, backtest, decomposition,
+                      portfolio/CAPM, multi-asset, dividend income, SQL)
 tests/                pytest suite (fixtures only — no live API calls in CI)
-run.py                CLI: screen | backtest | decompose | optimize | multiasset | dividend | export
+run.py                CLI: screen | backtest | decompose | optimize | multiasset | dividend |
+                      export | reports
 ```
 
 ## Methodology
@@ -129,8 +130,6 @@ the total (incl. specials) is still reported alongside for context.
 
 Being explicit so the claims above are not overstated:
 
-- **SQL as a first-class analytical layer** — `sql/queries.sql` exists but isn't yet executed by the
-  pipeline or surfaced as a dashboard tab.
 - **A reproducibility manifest** (git revision, config hash, data-snapshot dates, provider versions)
   written alongside every run's outputs.
 - **An analysis notebook** (`notebooks/analysis.ipynb`) walking through the FF decomposition and
@@ -171,6 +170,7 @@ python run.py optimize                  # CAPM betas + mean-variance portfolio o
 python run.py multiasset                # cross-asset (equity/bond/commodity ETF) allocation
 python run.py dividend                  # dividend-income screen (yield + payout sustainability)
 python run.py export                    # write outputs/*.parquet for the dashboard
+python run.py reports                   # run the named SQL analytics in sql/queries.sql
 
 streamlit run dashboard/app.py          # browse the results  (pip install -e ".[dashboard]")
 ```
