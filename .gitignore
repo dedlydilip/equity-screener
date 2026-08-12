@@ -12,8 +12,10 @@ venv/
 .env
 .cache/
 
-# Generated outputs (DB + large exports); keep committed result images elsewhere
+# Generated outputs (DB + large exports); keep committed result images elsewhere.
+# DuckDB also writes a sibling .wal, which the extension list above missed.
 outputs/*.duckdb
+outputs/*.duckdb.wal
 outputs/*.parquet
 outputs/*.csv
 

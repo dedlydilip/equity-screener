@@ -4,8 +4,30 @@ that most distinguish an institutional screener from a retail one."""
 import numpy as np
 import pandas as pd
 
-from screener.factors import compute_factors, pit_fundamentals
+from screener.factors import compute_factors, momentum_12_1, pit_fundamentals, price_asof
 from tests.conftest import make_quarters
+
+
+def test_price_asof_carries_each_ticker_forward_to_its_own_last_close():
+    """Taking the last ROW wholesale gives NaN to any name that didn't trade on
+    exactly that date -- and because halts/gaps correlate with distress, that
+    silently biases the cross-section."""
+    idx = pd.to_datetime(["2020-01-31", "2020-02-29", "2020-03-31"])
+    px = pd.DataFrame({"A": [10.0, 11.0, 12.0], "B": [20.0, 21.0, np.nan]}, index=idx)
+    out = price_asof(px, "2020-03-31")
+    assert out["A"] == 12.0
+    assert out["B"] == 21.0  # B's own last observation, not NaN
+
+
+def test_momentum_does_not_divide_by_a_non_positive_prior_price():
+    """A zero prior price is bad data; dividing by it yields +inf, which the
+    winsorizer would previously have clipped into a plausible-looking return."""
+    idx = pd.date_range("2019-01-31", periods=40, freq="ME")
+    px = pd.DataFrame({"GOOD": np.linspace(10, 20, 40), "BAD": np.linspace(10, 20, 40)}, index=idx)
+    px.loc[px.index[: 40 - 13], "BAD"] = 0.0  # zero price 13 months back
+    mom = momentum_12_1(px, px.index[-1])
+    assert np.isfinite(mom["GOOD"])
+    assert np.isnan(mom["BAD"])
 
 
 def test_pit_fundamentals_excludes_unfiled_future_quarter(qends, as_of):
@@ -23,7 +45,10 @@ def test_pit_fundamentals_excludes_unfiled_future_quarter(qends, as_of):
     pit = pit_fundamentals(fund, as_of)
 
     assert pit.loc["AAA", "net_income_ttm"] == 40.0  # 4 * 10, NOT poisoned by the 999999
-    assert 999999 not in fund[fund["filing_date"] <= as_of]["net_income"].values
+    # Once that quarter IS filed, it must actually be picked up -- otherwise the
+    # assertion above would also pass for a function that ignores late data.
+    later = pit_fundamentals(fund, pd.Timestamp("2023-11-30"))
+    assert later.loc["AAA", "net_income_ttm"] > 40.0
 
 
 def test_pit_fundamentals_advances_as_more_quarters_are_known(qends):

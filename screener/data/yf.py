@@ -36,6 +36,14 @@ class YFinanceProvider(DataProvider):
             close = data[["Close"]].copy()
             close.columns = [tickers[0] if isinstance(tickers, list) else tickers]
         close.index = pd.to_datetime(close.index)
+        # yfinance does not raise on a per-ticker failure -- it returns an
+        # all-NaN column. dropna(how="all") only drops all-NaN ROWS, so those
+        # columns used to survive into price_asof/momentum as silent NaNs.
+        empty = [str(c) for c in close.columns[close.isna().all()]]
+        if empty:
+            close = close.drop(columns=empty)
+            print(f"[yf] no price history for {len(empty)}/{len(close.columns) + len(empty)} "
+                  f"tickers (dropped): {', '.join(empty[:8])}{' ...' if len(empty) > 8 else ''}")
         return close.dropna(how="all")
 
     @staticmethod
@@ -79,17 +87,24 @@ class YFinanceProvider(DataProvider):
         as_of = pd.Timestamp(as_of) if as_of is not None else pd.Timestamp.today()
         as_of = as_of.normalize()
         cutoff = as_of - pd.DateOffset(years=1)
-        rows = []
+        rows: list[pd.DataFrame] = []
+        failed: list[str] = []
         for t in tickers:
             key = f"yf_div_{t}_{as_of.date()}_v2"
             cached = self._cache.get(key)
             if cached is not None:
                 rows.append(cached)
                 continue
+            # A FETCH FAILURE IS NOT A ZERO DIVIDEND. Swallowing the error here
+            # and falling through to 0.0 wrote "this company pays nothing" into a
+            # cache that never expires, permanently and silently reclassifying a
+            # payer as a non-payer. Skip the name instead, and never cache it, so
+            # the next run retries and the caller can see the coverage shortfall.
             try:
                 div = yf.Ticker(t).dividends
-            except Exception:
-                div = None
+            except Exception as e:  # noqa: BLE001 - yfinance raises many types
+                failed.append(f"{t} ({type(e).__name__})")
+                continue
             regular, special = 0.0, 0.0
             if div is not None and len(div):
                 div.index = pd.to_datetime(div.index, utc=True).tz_localize(None)
@@ -101,6 +116,10 @@ class YFinanceProvider(DataProvider):
             }])
             self._cache.put(key, rec)
             rows.append(rec)
+        if failed:
+            print(f"[yf] dividends unavailable for {len(failed)}/{len(tickers)} names "
+                  f"(excluded, not cached as zero): {', '.join(failed[:8])}"
+                  f"{' ...' if len(failed) > 8 else ''}")
         return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
     def get_fundamentals(self, tickers: list[str]) -> pd.DataFrame:  # pragma: no cover

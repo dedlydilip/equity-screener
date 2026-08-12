@@ -48,7 +48,7 @@ screener/
     yf.py             adjusted total-return prices (no API key)
     french.py          Fama-French 5 + momentum factor returns (Ken French Data Library)
     quality.py        data-quality gate: hard bounds, MAD winsorization, negative-denominator masks
-    cache.py          incremental parquet cache (works within FMP's free-tier rate limit)
+    cache.py          incremental parquet cache, versioned on the extraction rules + optional TTL
   factors.py          raw value / quality / momentum factors from PiT fundamentals + prices
   normalize.py        MAD sector-neutral z-scoring (hierarchy fallback) + inverse-vol composite
   portfolio.py         quantile assignment, equal / market-cap / inverse-vol weighting, concentration
@@ -79,7 +79,18 @@ run.py                CLI: screen | backtest | decompose | optimize | multiasset
 **Normalization:** robust z-score `(x − median) / (1.4826 × MAD)` within a group, clipped at ±5
 MAD. Groups follow a finest-first fallback hierarchy — GICS industry group (min 20 names) → GICS
 sector (min 20) → the full cross-section as a last resort — so a small industry group doesn't get
-a noisy median. The fallback split (% of names resolved at each level) is reported for the screen.
+a noisy median. The fallback split (% of names resolved at each level) is reported for the screen
+and persisted per rebalance date for the backtest.
+
+**Two-stage standardization (descriptors → sleeve → composite).** Each *descriptor* (E/P, B/P, ROE,
+…) is sector-neutral z-scored **first**, then the descriptors are blended into a sleeve score using
+the per-factor weights in `config.yaml`, then that blend is **re-standardized** so the sleeves are
+commensurable. Both stages matter: averaging the raw ratios instead would let the widest-dispersion
+descriptor dominate — B/P (~0.5) has roughly ten times the cross-sectional spread of E/P (~0.05) and
+FCF yield (~0.04), so a naively-averaged "value sleeve" is in practice ~90% book-to-price — and
+skipping the re-standardization would let the single-descriptor momentum sleeve outweigh the
+four-descriptor value and quality sleeves, since averaging *k* imperfectly-correlated z-scores shrinks
+the spread by roughly 1/√k.
 
 **Composite:** the three sleeve z-scores are combined into one score as the **weight-normalized mean
 of the sleeves a name actually has** — a missing sleeve (e.g. momentum before 12 months of history
@@ -90,7 +101,9 @@ volatility sets its weight (a steadier sleeve gets more say), capped at 50% with
 redistributed proportionally, and defaulting to equal weights during a 12-month no-look-ahead burn-in
 (before a full trailing window of sleeve returns exists). Wired into the backtest itself, not just
 unit-tested: at each rebalance date the sleeve weights are computed only from sleeve returns realized
-*strictly before* that date (`normalize.inverse_vol_weights`).
+*strictly before* that date (`normalize.inverse_vol_weights`). Window lengths are configured in
+**months** and converted to rebalance rows per frequency, so "12-month" means 12 months at monthly
+*and* at quarterly rather than 12 periods at each.
 
 **Validation:** Information Coefficient (Spearman), reported with **both an i.i.d. and a Newey-West
 HAC-adjusted t-statistic** (IC is autocorrelated across overlapping rebalances, so HAC is the
@@ -98,12 +111,36 @@ defensible figure), plus decay at 1/3/5-period lags; a quintile backtest (Q1..Q5
 weighted by the configured scheme — equal / market-cap / inverse-vol) with the Q5−Q1 spread's
 **gross and net-of-cost Sharpe**, **Max Drawdown**, and **per-rebalance and annualized turnover**;
 and the **FF5 + UMD alpha decomposition** (Newey-West standard errors) — the headline research layer.
-Transaction costs (commission + spread + short rebate, applied per-side and scaled by realized
-turnover) are subtracted from the gross spread to get the net figures reported above — net Sharpe is
-never allowed to exceed gross by construction. **Monthly and quarterly backtests are run and persisted
+Costs are applied on their own economic terms: commission and spread are **trading** costs and scale
+with realized turnover, while the short rebate is a **financing** cost on the short notional and is
+charged every period whether or not anything traded. Turnover is measured on **both legs** — the
+Q5−Q1 spread is a long/short book, so measuring only the long leg would undercount its trading by
+roughly half. **Monthly and quarterly backtests are run and persisted
 side by side** (a `freq` column on every table, so re-running one frequency never overwrites the
 other's rows), and the sector-neutral fallback percentage is persisted per rebalance date, not just
 printed once for the latest screen.
+
+**Bad data fails loudly rather than becoming a plausible number.** The failure mode that matters in a
+factor pipeline is not a crash — it is a number that looks fine and is wrong, because nothing
+downstream can tell the difference. So:
+
+- Infinities are **NaN'd, never winsorized**. Clipping an `inf` (a divide by a zero market cap or a
+  zero prior price) turns it into an ordinary-looking factor value that then z-scores and ranks near
+  the top of its sleeve, so the guard meant to catch bad data would be laundering it.
+- A missing forward return is **excluded and the bucket's weights renormalized**, not scored as a 0%
+  return; an uncovered quantile reports NaN rather than a fabricated observation.
+- A degenerate (constant) score cross-section produces **no quantile observation at all**, because
+  tie-breaking by rank would otherwise manufacture a large Q5−Q1 spread out of ticker ordering alone.
+- An unmeasurable effective tax rate leaves **ROIC NaN** instead of being back-filled with the 21%
+  statutory rate, which would be indistinguishable in the output from a measured one.
+- An infeasible sleeve cap, a degenerate covariance, an all-missing weighting panel, or a max-Sharpe
+  problem where no asset beats the risk-free rate all **raise**, rather than silently returning the
+  uncapped / highest-volatility / equal-weighted answer.
+- Data-layer shortfalls are **counted and reported**: EDGAR coverage per run, tickers dropped and why,
+  unparseable index-change rows, and a stale-cache fallback announces its own age. A fetch failure is
+  never cached as "this company pays no dividend."
+- The on-disk cache is **versioned on the XBRL tag maps**, so changing an extraction rule invalidates
+  the affected entries instead of silently returning frames built by the old code.
 
 **Portfolio construction & CAPM:** each screened name gets a CAPM beta and alpha (regressing its
 excess return on the market factor, Newey-West errors), shown on a Security Market Line. A long-only
@@ -185,39 +222,47 @@ pytest -q
 
 ## Results (real data)
 
-Full S&P 500 universe (point-in-time membership: 503 current + 242 historically-removed/renamed
-names pulled for the window), **2015-01 → 2024-12**, on real EDGAR fundamentals + yfinance
-total-return prices, both rebalance frequencies persisted side by side in the same run
-(`python run.py screen`, then `backtest` / `decompose`, no `--freq`):
+Full S&P 500 universe (point-in-time membership: 503 current + historically-removed/renamed names
+pulled for the window; EDGAR fundamentals recovered for 601/745 = 80.7% of them), **2015-01 →
+2024-12**, on real EDGAR fundamentals + yfinance total-return prices, both rebalance frequencies
+persisted side by side in the same run (`python run.py screen`, then `backtest` / `decompose`, no
+`--freq`):
 
 | metric | monthly (118 rebalances) | quarterly (38 rebalances) |
 |---|---|---|
-| Mean IC (HAC t-stat) | +0.0067 (t = 0.84) | +0.0120 (t = 0.89) |
-| Q5−Q1 spread, gross / net of costs | +0.15% / **−0.01%** per period | +0.57% / **+0.27%** per period |
-| Sharpe, gross / net of costs | 0.31 / **−0.03** | 0.39 / **0.18** |
-| Max Drawdown (Q5−Q1) | −13.5% | −6.7% |
-| Turnover, per-rebalance / annualized | 40.0% / **480%/yr** | 75.2% / **301%/yr** |
-| FF5+UMD alpha (annualized, NW t) | +1.9% (t = 0.92) | +2.8% (t = 1.54) |
+| Mean IC (HAC t-stat) | +0.0076 (t = 0.84) | +0.0155 (t = 1.06) |
+| Q5−Q1 spread, gross / net of costs | +0.148% / **+0.014%** per period | +0.569% / **+0.276%** per period |
+| Sharpe, gross / net of costs | 0.30 / **0.03** | 0.36 / **0.18** |
+| Q5 long leg, Sharpe (excess of Rf) | 0.81 | 0.76 |
+| Max Drawdown (Q5−Q1) | −13.7% | −10.7% |
+| Turnover, per-rebalance / annualized | 75.2% / **902%/yr** | 153.6% / **614%/yr** |
+| FF5+UMD alpha (annualized, NW t) | +1.2% (t = 0.60) | +3.6% (t = 1.94) |
+| FF5+UMD R² | 0.03 | 0.24 |
 
-Net figures subtract commission + spread + short-rebate costs (40 bps/side, `config.yaml`) scaled by
-the realized turnover shown alongside.
+Turnover is two-way and counts **both legs** of the long/short book. Net figures subtract commission +
+spread (15 bps/side) scaled by that realized turnover, plus a 25 bps **per-annum** stock-borrow charge
+on the short notional, accrued per rebalance (`config.yaml`).
 
-Latest screen: 41 names, effective N ≈ 41 (HHI 0.024, top-10% weight 9.8%) — diversified across
-sectors. Sector-neutral normalization resolved **67–68% of value/quality scores and 67% of momentum
-scores within their GICS industry group**, ~28–33% at the sector level, and under 4% at the full
-cross-section — the hierarchy is doing its job on the full universe rather than falling back to a
-noisy broad median.
+Latest screen: 42 names, effective N ≈ 42 (HHI 0.024, top-10% weight 9.5%) — diversified across all 11
+GICS sectors. Sector-neutral normalization resolved **67–72% of scores within their GICS industry
+group**, ~28–33% at sector level, and 0–4% at the full cross-section, so the hierarchy is doing its job
+rather than falling back to a noisy broad median.
 
-**The honest read — this is the finding the pipeline exists to surface, not paper over:** neither
-frequency's signal is statistically distinguishable from zero (HAC IC t-stats of 0.84 and 0.89; FF5+UMD
-alpha NW t-stats of 0.92 and 1.54 are all well under the ~2.0 conventional bar). And **turnover is
-what actually decides whether the weak edge is investable**: at monthly rebalancing the composite
-churns 480%/year, which is expensive enough that transaction costs erase the entire gross spread and
-flip net Sharpe negative (0.31 → −0.03). At quarterly rebalancing turnover drops to 301%/year and
-roughly half the gross edge survives net of costs (0.39 → 0.18), with a shallower drawdown too
-(−6.7% vs. −13.5%). A simple equal/inverse-vol-weighted Value/Quality/Momentum composite over the full
-liquid large-cap S&P 500 has a real but weak, cost-sensitive edge that is not tradeable at monthly
-frequency and only marginally so at quarterly — a realistic result, not an overfit backtest.
+**The honest read — this is the finding the pipeline exists to surface, not paper over.** No result
+here clears a conventional significance bar. The IC is indistinguishable from zero at both frequencies
+(HAC t = 0.84 and 1.06). The strongest single number is the quarterly FF5+UMD alpha of **+3.6%/yr, but
+its Newey-West t of 1.94 sits just *below* the ~1.96 two-sided 5% threshold** — and since two
+frequencies were tested, even that would not survive a multiple-testing adjustment. It should be read
+as suggestive, not as a finding.
+
+**Turnover is what decides whether the weak edge is investable.** At monthly rebalancing the composite
+churns 902%/yr two-way, and costs consume essentially the entire gross spread (Sharpe 0.30 → **0.03**;
++14.8 bps/month gross → +1.4 bps net). At quarterly the book turns over 614%/yr and roughly half the
+gross edge survives (0.36 → **0.18**, ≈ +1.1%/yr net), with a shallower drawdown (−10.7% vs. −13.7%).
+So: a Value/Quality/Momentum composite over the full liquid large-cap S&P 500 has a real but weak,
+heavily cost-sensitive edge — not tradeable monthly, and only marginally so quarterly. That is a
+realistic result rather than an overfit backtest, and the pipeline is built to make it visible instead
+of flattering it.
 
 ## Limitations
 
@@ -247,8 +292,10 @@ frequency and only marginally so at quarterly — a realistic result, not an ove
   quality gate handles missing values (a factor simply doesn't contribute for that name).
 - **MAD can be noisy in small groups** — mitigated by the finest-first fallback hierarchy with a
   reported fallback percentage, but not eliminated.
-- **Transaction costs are modeled, not simulated** — commission, spread, and short-rebate are
-  applied as flat per-side bps, not a market-impact model.
+- **Transaction costs are modeled, not simulated** — commission and spread are flat per-side bps
+  scaled by realized turnover, and the short rebate is a flat per-period financing charge. There is
+  no market-impact model, and the cost drag uses the *average* turnover across rebalances rather than
+  each period's own, so a single unusually heavy rebalance is smoothed rather than charged in full.
 - **Mean-variance is estimation-error sensitive** — the optimizer uses plain sample means and
   covariances, so it produces concentrated, sometimes corner solutions (e.g. the multi-asset run
   can allocate ~0% to bonds when their sample risk-adjusted return over the window is weak). That is

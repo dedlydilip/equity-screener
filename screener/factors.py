@@ -16,7 +16,11 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .data.quality import mask_negative_denominator, winsorize_cross_sectional
+from .data.quality import (
+    mask_negative_denominator,
+    nan_out_of_bounds,
+    winsorize_cross_sectional,
+)
 
 FLOW = ["revenue", "gross_profit", "operating_income", "pretax_income", "tax_expense",
         "net_income", "ebitda", "free_cash_flow"]
@@ -60,9 +64,18 @@ def pit_fundamentals(fund: pd.DataFrame, as_of) -> pd.DataFrame:
 
 
 def price_asof(prices: pd.DataFrame, as_of) -> pd.Series:
-    """Last available close on/before ``as_of`` for each ticker."""
+    """Last available close on/before ``as_of``, PER TICKER.
+
+    Taking the last row wholesale would give NaN to any name that didn't trade
+    on exactly that date (halted, thinly traded, or a yfinance gap), silently
+    dropping it from the cross-section. Because those absences correlate with
+    distress, that is a coverage bias that flatters the backtest -- so each
+    ticker's own last observation is carried forward instead.
+    """
     px = prices[prices.index <= pd.Timestamp(as_of)]
-    return px.iloc[-1] if len(px) else pd.Series(dtype=float)
+    if not len(px):
+        return pd.Series(dtype=float)
+    return px.ffill().iloc[-1]
 
 
 def momentum_12_1(prices: pd.DataFrame, as_of) -> pd.Series:
@@ -72,7 +85,9 @@ def momentum_12_1(prices: pd.DataFrame, as_of) -> pd.Series:
     old = price_asof(prices, as_of - pd.DateOffset(months=13))
     if recent.empty or old.empty:
         return pd.Series(dtype=float)
-    return recent / old - 1.0
+    # A non-positive prior price is bad data, not a 100% loss: dividing by it
+    # yields +/-inf or a sign-flipped return.
+    return recent / old.where(old > 0) - 1.0
 
 
 def compute_factors(
@@ -105,8 +120,16 @@ def compute_factors(
     # Fall back to diluted shares only where the dated figure is unavailable.
     shares = g["shares_outstanding"].where(g["shares_outstanding"] > 0, g["shares_diluted"])
 
-    mcap = price * shares
-    etr = (tax / pretax).where(pretax > 0).clip(0, 0.5).fillna(0.21)
+    # Guard the divisor before it is used: a zero/missing share count would make
+    # mcap 0 and turn every price ratio into +/-inf, which the winsorizer would
+    # then have to deal with. Non-positive market cap is missing data, not a
+    # cheap stock.
+    mcap = (price * shares).where(lambda m: m > 0)
+    # Effective tax rate, used only for ROIC. Where it can't be measured (a loss
+    # maker, or a missing tax tag) it stays NaN and ROIC goes NaN with it --
+    # substituting the 21% statutory rate here would have produced a fabricated
+    # ROIC indistinguishable in the output from a genuinely measured one.
+    etr = (tax / pretax).where(pretax > 0).clip(0, 0.5)
     ev = mcap + debt - cash
     ic = debt + book - cash
 
@@ -128,10 +151,12 @@ def compute_factors(
     # --- Momentum ---
     f["momentum"] = momentum_12_1(prices, as_of).reindex(tickers)
 
-    # Quality gate: positive earnings + P/E sanity bounds on E/P
-    pe = (mcap / ni).where(ni > 0)
+    # Quality gate layer 1: positive earnings + P/E hard sanity bounds on E/P.
+    # Uses quality.nan_out_of_bounds rather than re-inlining the comparison, so
+    # the documented gate and the unit-tested function are the same code.
     lo, hi = gates.pe_bounds
-    f["ep"] = f["ep"].where((pe > lo) & (pe < hi))
+    pe_ok = nan_out_of_bounds((mcap / ni).where(ni > 0), lo, hi)
+    f["ep"] = f["ep"].where(pe_ok.notna())
 
     # Winsorize each factor cross-sectionally (tame extremes pre-normalization)
     for c in FACTORS:

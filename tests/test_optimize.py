@@ -72,3 +72,50 @@ def test_weights_are_long_only_even_with_negative_expected_returns():
     w = max_sharpe_weights(mean, cov, rf=0.0)
     assert (w >= -1e-9).all()
     assert w.sum() == pytest.approx(1.0, abs=1e-6)
+
+
+def test_max_sharpe_aligns_mean_to_cov_by_label_not_position():
+    """mean/cov .values were taken independently, so a differently-ordered mean
+    silently produced wrong weights carrying correct-looking labels."""
+    assets = ["X", "Y", "Z"]
+    cov = pd.DataFrame(np.diag([0.04, 0.09, 0.01]), index=assets, columns=assets)
+    mean = pd.Series({"X": 0.08, "Y": 0.10, "Z": 0.06})
+    ordered = max_sharpe_weights(mean, cov, rf=0.01)
+    shuffled = max_sharpe_weights(mean.reindex(["Z", "X", "Y"]), cov, rf=0.01)
+    pd.testing.assert_series_equal(ordered, shuffled.reindex(ordered.index), rtol=1e-6)
+
+
+def test_max_sharpe_raises_when_no_asset_beats_the_risk_free_rate():
+    """Maximizing (r-rf)/vol over an all-negative numerator inverts the
+    objective and picks the HIGHEST-volatility asset as the 'best' portfolio."""
+    assets = ["A", "B", "C"]
+    cov = pd.DataFrame(np.diag([0.01, 0.04, 0.09]), index=assets, columns=assets)
+    mean = pd.Series({"A": 0.010, "B": 0.005, "C": 0.002})
+    with pytest.raises(ValueError, match="exceeds rf"):
+        max_sharpe_weights(mean, cov, rf=0.05)
+
+
+def test_optimizers_reject_a_zero_variance_asset_instead_of_loading_into_it():
+    """The 1e-12 volatility floor let the optimizer put 100% into a degenerate
+    asset, which portfolio_stats then scored as sharpe=NaN -- the two functions
+    disagreeing about the very portfolio one of them had just chosen."""
+    assets = ["OK", "DEGENERATE"]
+    cov = pd.DataFrame(np.diag([0.04, 0.0]), index=assets, columns=assets)
+    mean = pd.Series({"OK": 0.08, "DEGENERATE": 0.09})
+    with pytest.raises(ValueError, match="non-positive variance"):
+        max_sharpe_weights(mean, cov, rf=0.02)
+    with pytest.raises(ValueError, match="non-positive variance"):
+        min_variance_weights(cov)
+
+
+def test_frontier_reports_the_return_each_solved_portfolio_actually_achieves():
+    assets = ["A", "B", "C"]
+    rng = np.random.default_rng(5)
+    x = rng.normal(0, 0.02, size=(200, 3))
+    cov = pd.DataFrame(np.cov(x, rowvar=False), index=assets, columns=assets)
+    mean = pd.Series({"A": 0.04, "B": 0.07, "C": 0.10})
+    curve = efficient_frontier(mean, cov, n_points=12)
+    assert (curve["volatility"].diff().dropna() >= -1e-9).all()   # upper branch
+    # every recorded return must be attainable by some long-only mix
+    assert curve["target_return"].min() >= mean.min() - 1e-9
+    assert curve["target_return"].max() <= mean.max() + 1e-9

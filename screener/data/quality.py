@@ -32,8 +32,16 @@ def mad(x: pd.Series) -> float:
 
 
 def winsorize_cross_sectional(s: pd.Series, n_mad: float) -> pd.Series:
-    """Clip values beyond ``n_mad`` scaled-MADs of the cross-sectional median."""
-    s = s.astype(float)
+    """Clip values beyond ``n_mad`` scaled-MADs of the cross-sectional median.
+
+    Infinities are NaN'd first, never clipped. An ``inf`` is a data error (a
+    divide by a zero market cap or a zero prior price), not an extreme
+    observation -- clipping would turn it into a finite, entirely ordinary
+    looking factor value that then z-scores and ranks near the top of its
+    sleeve. Removing them first also keeps the median/MAD bounds themselves
+    computed on real data.
+    """
+    s = s.astype(float).replace([np.inf, -np.inf], np.nan)
     med = s.median()
     m = mad(s)
     if not np.isfinite(m) or m == 0:

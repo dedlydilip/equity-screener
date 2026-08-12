@@ -48,6 +48,7 @@ from screener.portfolio import assign_quantiles, concentration
 from screener.portfolio import weights as portfolio_weights
 from screener.report import export_for_dashboard, run_reports
 from screener.screen import apply_hard_filters, build_screen
+from screener.universe import coverage as universe_coverage
 from screener.universe import get_sp500
 from screener.validate import (
     ff_decompose,
@@ -66,6 +67,42 @@ from screener.validate import (
 def _month_ends(start: str, end: str, freq: str) -> pd.DatetimeIndex:
     rule = "ME" if freq == "monthly" else "QE"
     return pd.date_range(start, end, freq=rule)
+
+
+def _months_per_period(freq: str) -> int:
+    return 1 if freq == "monthly" else 3
+
+
+def _months_to_rows(months: int, freq: str) -> int:
+    """Convert a config window expressed in MONTHS into a number of rebalance
+    ROWS at this frequency.
+
+    ``vol_lookback_months`` / ``burn_in_months`` are month-denominated, but they
+    are consumed as ``iloc`` row counts. Passing 12 straight through gave the
+    quarterly backtest a 12-QUARTER (36-month) window and a 36-month burn-in --
+    so monthly and quarterly were not the same experiment at two frequencies,
+    which is exactly what comparing them is supposed to measure.
+    """
+    return max(1, int(months) // _months_per_period(freq))
+
+
+def _ff_at_freq(ff: pd.DataFrame, freq: str) -> pd.DataFrame:
+    """Put the (monthly) Ken French factors on the backtest's own clock.
+
+    The library is monthly; a quarterly backtest earns a 3-month return, so the
+    risk-free rate it is charged must be the COMPOUNDED 3-month rate. Charging
+    the raw 1-month rate under-subtracts Rf and overstates every excess-return
+    Sharpe.
+    """
+    out = pd.DataFrame(ff)
+    # get_ff_factors already hands back month-end timestamps, but the underlying
+    # famafrench reader yields a PeriodIndex -- accept either.
+    idx = out.index
+    idx = idx.to_timestamp() if isinstance(idx, pd.PeriodIndex) else pd.to_datetime(idx)
+    out.index = pd.DatetimeIndex(idx).to_period("M").to_timestamp("M")
+    if freq != "monthly":
+        out = out.resample("QE").apply(lambda x: (1 + x).prod() - 1)
+    return out
 
 
 def _load_universe_and_data(
@@ -123,12 +160,31 @@ def _composite_at(fund, prices, uni, cfg: Config, as_of, sleeve_weights: dict[st
     """
     uni_idx = uni.set_index("ticker")
     raw = compute_factors(fund, prices, as_of, cfg.quality_gates, sector=uni_idx["sector"])
-    z_by_sleeve = {}
-    fallback_pct = {}
+    hierarchy = [h.model_dump() for h in cfg.normalization.hierarchy]
+    clip = cfg.normalization.clip
+    factor_weights = cfg.factors.model_dump()
+    z_by_sleeve, fallback_pct = {}, {}
     for sleeve, cols in SLEEVES.items():
-        sleeve_vals = raw[cols].mean(axis=1, skipna=True)  # equal-weight within the sleeve
-        hierarchy = [h.model_dump() for h in cfg.normalization.hierarchy]
-        z, pct = sector_neutral_z(sleeve_vals, uni_idx, hierarchy, cfg.normalization.clip)
+        # 1. Standardize EACH descriptor within its peer group first. Averaging
+        #    the raw ratios instead let the widest-dispersion one dominate: B/P
+        #    (~0.5) has roughly ten times the cross-sectional spread of E/P
+        #    (~0.05) and FCF yield (~0.04), so the "value sleeve" was in practice
+        #    ~90% book-to-price and the configured per-factor weights could not
+        #    mean anything.
+        zdf = pd.DataFrame({c: sector_neutral_z(raw[c], uni_idx, hierarchy, clip)[0]
+                            for c in cols})
+        # 2. Blend the descriptors with the configured weights, renormalized over
+        #    the ones each name actually has (same coverage rule composite() uses
+        #    across sleeves, so a missing descriptor doesn't drag a name to zero).
+        w = pd.Series({c: float(factor_weights.get(sleeve, {}).get(c, 1.0)) for c in cols})
+        present = zdf.notna()
+        den = present.mul(w, axis=1).sum(axis=1)
+        blended = zdf.fillna(0.0).mul(w, axis=1).sum(axis=1) / den.where(den > 0)
+        # 3. Re-standardize the blend so sleeves are commensurable: averaging k
+        #    imperfectly-correlated z-scores shrinks the spread by roughly
+        #    1/sqrt(k), which would otherwise let single-descriptor momentum
+        #    dominate the four-descriptor value and quality sleeves.
+        z, pct = sector_neutral_z(blended, uni_idx, hierarchy, clip)
         z_by_sleeve[sleeve] = z
         fallback_pct[sleeve] = pct
     comp = composite(z_by_sleeve, sleeve_weights)
@@ -176,7 +232,14 @@ def cmd_screen(cfg: Config, con, max_names=None, only=None) -> None:
 
     print(f"Screen as of {as_of.date()}: {len(screen_df)} names")
     print(screen_df.head(15).to_string())
-    print(f"\nNormalization fallback %: {fallback_pct}")
+    # GICS mapping coverage: the sector-neutral hierarchy can only resolve at
+    # industry-group level for names it has a mapping for, so this is the
+    # ceiling on the fallback percentages reported next to it.
+    cov = universe_coverage(uni)
+    print(f"\nUniverse: {cov['n']} names, {cov['sectors']} sectors, "
+          f"{cov['industry_groups']} industry groups "
+          f"({cov['industry_group_mapped_pct']}% mapped to an industry group)")
+    print(f"Normalization fallback %: {fallback_pct}")
     print(f"Concentration: HHI={conc['hhi']:.3f}  top10%={conc['top_10pct_weight']:.1%}  "
           f"effective_n={conc['effective_n']:.1f}")
 
@@ -267,10 +330,16 @@ def _run_one_backtest(cfg: Config, con, freq: str, max_names=None) -> None:
     hf = cfg.portfolio.hard_filters
     scores, market_cap_hist, vols_hist = {}, {}, {}
     for i, dt in enumerate(sleeve_returns_df.index):
-        sleeve_w = inverse_vol_weights(
-            sleeve_returns_df, lookback=cfg.weighting.vol_lookback_months,
-            max_weight=cfg.weighting.max_sleeve_weight,
-            burn_in=cfg.weighting.burn_in_months, as_of_row=i)
+        if cfg.weighting.method == "inverse_vol":
+            sleeve_w = inverse_vol_weights(
+                sleeve_returns_df,
+                lookback=_months_to_rows(cfg.weighting.vol_lookback_months, freq),
+                max_weight=cfg.weighting.max_sleeve_weight,
+                burn_in=_months_to_rows(cfg.weighting.burn_in_months, freq), as_of_row=i)
+        elif cfg.weighting.method == "equal":
+            sleeve_w = equal_w
+        else:  # "custom" -> the pre-registered sleeve_weights block in config.yaml
+            sleeve_w = cfg.sleeve_weights.model_dump()
         raw, z_by_sleeve = raw_hist[dt], z_hist[dt]
         comp = composite(z_by_sleeve, sleeve_w, min_sleeves=2)
         eligible = apply_hard_filters(raw, hf)
@@ -319,22 +388,37 @@ def _run_one_backtest(cfg: Config, con, freq: str, max_names=None) -> None:
     # holdings-weight panel, using the SAME weighting scheme as the quintile
     # returns above, so turnover and the returns it costs are consistent.
     spread = qr["spread"] if "spread" in qr else pd.Series(dtype=float)
-    holdings = {}
+    # Turnover is measured on BOTH legs: the Q5-Q1 spread is a long/short book,
+    # so it trades the short leg too. Measuring only Q5 and charging the result
+    # against the spread undercounted the trading by roughly half.
+    n_q = cfg.portfolio.n_quantiles
+    long_h, short_h = {}, {}
     for dt in scores_df.index:
         s = scores_df.loc[dt].dropna()
-        if len(s) < cfg.portfolio.n_quantiles * 2:
+        if len(s) < n_q * 2:
             continue
-        q5 = assign_quantiles(s, cfg.portfolio.n_quantiles)
-        q5_members = q5[q5 == cfg.portfolio.n_quantiles].index
+        q = assign_quantiles(s, n_q)
+        top, bottom = q[q == n_q].index, q[q == 1].index
+        if not len(top) or not len(bottom):
+            continue
         mc = market_cap_df.loc[dt] if dt in market_cap_df.index else None
         vv = vols_df.loc[dt] if dt in vols_df.index else None
-        holdings[dt] = portfolio_weights(q5_members, method, market_cap=mc, vols=vv)
-    holdings_df = pd.DataFrame(holdings).T.reindex(scores_df.index).fillna(0.0)
-    tn = turnover(holdings_df, ppy=12 if freq == "monthly" else 4)
+        long_h[dt] = portfolio_weights(top, method, market_cap=mc, vols=vv)
+        short_h[dt] = portfolio_weights(bottom, method, market_cap=mc, vols=vv)
+    # Index on the dates that actually formed a portfolio. Reindexing onto every
+    # scored date and filling 0.0 turned each skipped rebalance into a phantom
+    # full liquidation AND re-entry, inflating turnover (and the cost drag that
+    # rides on it) purely from data gaps.
+    ppy_t = 12 if freq == "monthly" else 4
+    tn_long = turnover(pd.DataFrame(long_h).T.sort_index().fillna(0.0), ppy=ppy_t)
+    tn_short = turnover(pd.DataFrame(short_h).T.sort_index().fillna(0.0), ppy=ppy_t)
+    tn = {k: tn_long[k] + tn_short[k] for k in tn_long}   # both legs trade
 
-    ff = get_ff_factors(start=cfg.backtest.start, end=cfg.backtest.end)
-    ff.index = pd.to_datetime(ff.index).to_period("M").to_timestamp("M")
-    spread_idx = spread.index.to_period("M").to_timestamp("M") if len(spread) else spread.index
+    # Rf must be on the backtest's own clock: a quarterly leg earns a 3-month
+    # return and so must be charged the COMPOUNDED 3-month risk-free rate.
+    ff = _ff_at_freq(get_ff_factors(start=cfg.backtest.start, end=cfg.backtest.end), freq)
+    per = "M" if freq == "monthly" else "Q"
+    spread_idx = spread.index.to_period(per).to_timestamp(per) if len(spread) else spread.index
     spread_m = pd.Series(spread.values, index=spread_idx)
     rf = ff["RF"].reindex(spread_m.index)
 
@@ -342,15 +426,26 @@ def _run_one_backtest(cfg: Config, con, freq: str, max_names=None) -> None:
     gross_sharpe = sharpe(spread, rf=None, ppy=ppy)  # self-financing -> no Rf
     q5_returns = qr["Q5"] if "Q5" in qr else pd.Series(dtype=float)
     if len(q5_returns):
-        q5_idx = q5_returns.index.to_period("M").to_timestamp("M")
+        q5_idx = q5_returns.index.to_period(per).to_timestamp(per)
     else:
         q5_idx = q5_returns.index
     q5_m = pd.Series(q5_returns.values, index=q5_idx)
     q5_gross_sharpe = sharpe(q5_m, rf=rf.reindex(q5_m.index), ppy=ppy)
     mdd = max_drawdown(spread)
 
-    cost_bps = cfg.costs.commission_bps + cfg.costs.spread_bps + cfg.costs.short_rebate_bps
-    net_spread = net_of_cost(spread, tn["per_rebalance_two_way"], cost_bps)
+    # Two economically different costs, applied on their own terms:
+    #   * commission + spread are TRADING costs -> per side, scaled by realized
+    #     turnover (which now counts both legs of the long/short book).
+    #   * the short rebate is a FINANCING cost on the short notional -> a rate
+    #     PER YEAR, accrued over the holding period, charged whether or not
+    #     anything traded.
+    # Folding the rebate into the per-turnover multiplication is dimensionally
+    # wrong (it made financing rise and fall with trading activity); charging the
+    # annual rate once per rebalance is 12x too much at monthly frequency.
+    trade_bps = cfg.costs.commission_bps + cfg.costs.spread_bps
+    net_spread = net_of_cost(spread, tn["per_rebalance_two_way"], trade_bps)
+    financing_per_period = (cfg.costs.short_rebate_bps_annual / 1e4) / ppy
+    net_spread = net_spread - financing_per_period
     net_sharpe = sharpe(net_spread, rf=None, ppy=ppy)
 
     summary = pd.DataFrame([{
@@ -394,13 +489,12 @@ def cmd_decompose(cfg: Config, con, freq: str = "monthly") -> None:
     spread = piv[piv.columns.max()] - piv[piv.columns.min()]
     spread.index = pd.to_datetime(spread.index)
 
-    ff = get_ff_factors(start=cfg.backtest.start, end=cfg.backtest.end)
+    # Compound the monthly factors onto the backtest's own clock before
+    # regressing (shared with the backtest so both use one convention).
+    ff = _ff_at_freq(get_ff_factors(start=cfg.backtest.start, end=cfg.backtest.end), freq)
     ann = 12 if freq == "monthly" else 4
     period = "M" if freq == "monthly" else "Q"
-    ff.index = pd.to_datetime(ff.index).to_period(period).to_timestamp(period)
     spread.index = spread.index.to_period(period).to_timestamp(period)
-    if freq != "monthly":  # FF factors are monthly; resample to the backtest's own frequency
-        ff = ff.resample("QE").apply(lambda x: (1 + x).prod() - 1)
 
     result = ff_decompose(spread, ff, is_long_short=True, ppy=ann)
     rows = [{"freq": freq, "metric": "alpha_period", "value": result["alpha_monthly"]},

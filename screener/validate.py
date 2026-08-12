@@ -81,6 +81,21 @@ def ic_decay(scores: pd.DataFrame, returns_panel: pd.DataFrame, lags=(1, 3, 5)) 
     return out
 
 
+def _bucket(s: pd.Series, n: int) -> pd.Series | None:
+    """Assign scores to 1..n quantile buckets, or ``None`` if the cross-section
+    carries no usable signal.
+
+    Ties are broken by ``rank(method="first")``, i.e. by column order. That is
+    fine for a handful of ties but catastrophic for a degenerate cross-section:
+    a constant score vector would be sorted into "quintiles" by ticker order and
+    report a large Q5-Q1 spread from a signal with zero information. Requiring
+    at least ``n`` distinct values makes that case return no observation.
+    """
+    if len(s) < n * 2 or s.nunique() < n:
+        return None
+    return pd.qcut(s.rank(method="first"), n, labels=list(range(1, n + 1)))
+
+
 def quintile_returns(scores: pd.DataFrame, fwd_returns: pd.DataFrame, n: int = 5) -> pd.DataFrame:
     """Equal-weighted forward return of each score quintile, per date; + Q5-Q1 spread."""
     rows = {}
@@ -88,9 +103,9 @@ def quintile_returns(scores: pd.DataFrame, fwd_returns: pd.DataFrame, n: int = 5
         if dt not in fwd_returns.index:
             continue
         s = scores.loc[dt].dropna()
-        if len(s) < n * 2:
+        q = _bucket(s, n)
+        if q is None:
             continue
-        q = pd.qcut(s.rank(method="first"), n, labels=list(range(1, n + 1)))
         rows[dt] = fwd_returns.loc[dt].reindex(s.index).groupby(q, observed=True).mean()
     df = pd.DataFrame(rows).T
     df.columns = [f"Q{int(c)}" for c in df.columns]
@@ -110,23 +125,31 @@ def weighted_quintile_returns(
     ``market_cap``/``vols`` are optional (dates x tickers) panels required for
     ``method="market_cap"``/``"inverse_vol"`` respectively (unused, and may be
     ``None``, for ``method="equal"``).
+
+    Names without a realized forward return are EXCLUDED and the bucket's
+    weights renormalized over those that remain, so a coverage gap doesn't get
+    silently scored as a 0% return. With ``method="equal"`` this reduces exactly
+    to :func:`quintile_returns`; an uncovered bucket yields NaN, not 0.0.
     """
     rows = {}
     for dt in scores.index:
         if dt not in fwd_returns.index:
             continue
         s = scores.loc[dt].dropna()
-        if len(s) < n * 2:
+        q = _bucket(s, n)
+        if q is None:
             continue
-        q = pd.qcut(s.rank(method="first"), n, labels=list(range(1, n + 1)))
         fwd = fwd_returns.loc[dt].reindex(s.index)
         mc = market_cap.loc[dt] if market_cap is not None and dt in market_cap.index else None
         vv = vols.loc[dt] if vols is not None and dt in vols.index else None
         row = {}
         for bucket in range(1, n + 1):
-            members = q[q == bucket].index
-            w = _portfolio_weights(members, method=method, market_cap=mc, vols=vv)
-            row[bucket] = float((fwd.reindex(members) * w.reindex(members)).sum())
+            covered = fwd.reindex(q[q == bucket].index).dropna()
+            if covered.empty:
+                row[bucket] = np.nan   # no covered name -> no observation
+                continue
+            w = _portfolio_weights(covered.index, method=method, market_cap=mc, vols=vv)
+            row[bucket] = float((covered * w.reindex(covered.index)).sum())
         rows[dt] = pd.Series(row)
     df = pd.DataFrame(rows).T
     df.columns = [f"Q{int(c)}" for c in df.columns]
@@ -144,10 +167,18 @@ def sharpe(returns: pd.Series, rf: pd.Series | None = None, ppy: int = 12) -> fl
 
 
 def max_drawdown(returns: pd.Series) -> float:
+    """Worst peak-to-trough decline of the compounded return series.
+
+    The running peak is floored at 1.0 -- the notional value at t0, before the
+    first period is earned. Without that floor ``cummax`` starts at the first
+    period's own value, so an opening loss reports a drawdown of exactly zero
+    while the identical loss one period later reports correctly.
+    """
     curve = (1 + returns.dropna()).cumprod()
     if curve.empty:
         return np.nan
-    return float((curve / curve.cummax() - 1).min())
+    peak = curve.cummax().clip(lower=1.0)
+    return float((curve / peak - 1).min())
 
 
 def turnover(holdings: pd.DataFrame, ppy: int = 12) -> dict:

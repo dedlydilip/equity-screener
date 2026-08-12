@@ -188,9 +188,10 @@ with tab2:
             c2.metric("Sharpe gross / net", f"{row['gross_sharpe']:.2f} / {row['net_sharpe']:.2f}")
             c3.metric("Max Drawdown", f"{row['max_drawdown'] * 100:.1f}%")
             c4.metric("Turnover (ann.)", f"{row['turnover_annualized'] * 100:.0f}%")
-            st.caption(f"Net figures subtract transaction costs (commission + spread + "
-                      f"short rebate) scaled by realized turnover — net is always ≤ "
-                      f"gross. Mean IC = {row['mean_ic']:.4f} "
+            st.caption(f"Turnover is two-way and counts **both legs** of the long/short book. "
+                      f"Net subtracts commission + spread scaled by that turnover, plus a "
+                      f"per-annum stock-borrow charge on the short notional accrued per "
+                      f"rebalance — so net is always ≤ gross. Mean IC = {row['mean_ic']:.4f} "
                       f"(Newey-West t = {row['ic_t_stat_hac']:.2f}).")
         else:
             # Fall back to a quick recompute if backtest_summary hasn't been exported yet

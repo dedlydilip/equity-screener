@@ -11,13 +11,17 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
+import pandas as pd
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class UniverseConfig(BaseModel):
-    name: str = "sp500"
-    source: Literal["wikipedia", "fmp"] = "wikipedia"
+    # "fmp" was offered here but never implemented -- get_sp500 always reads
+    # Wikipedia. Narrowed to what actually exists rather than advertising a
+    # source that silently does nothing.
+    name: Literal["sp500"] = "sp500"
+    source: Literal["wikipedia"] = "wikipedia"
 
 
 class DataConfig(BaseModel):
@@ -25,13 +29,41 @@ class DataConfig(BaseModel):
     fmp_api_key_env: str = "FMP_API_KEY"
     edgar_contact: str = "adilip407@gmail.com"
     cache_dir: str = ".cache"
-    fundamentals_pit: bool = True
+    # NOTE: `fundamentals_pit` was removed -- point-in-time gating by SEC filing
+    # date is unconditional in factors.pit_fundamentals and cannot be turned
+    # off, so a flag claiming otherwise was misleading.
 
 
 class FactorConfig(BaseModel):
+    """Descriptor weights within each sleeve.
+
+    Keys are validated against the factor columns the pipeline actually
+    computes: the momentum sleeve was configured as ``ret_12_1`` while the
+    column is ``momentum``, so the weight could never have been applied to
+    anything -- exactly the kind of silent config/code drift this catches.
+    """
+
     value: dict[str, float]
     quality: dict[str, float]
     momentum: dict[str, float]
+
+    @model_validator(mode="after")
+    def _keys_match_pipeline_factors(self) -> FactorConfig:
+        from .factors import SLEEVES  # local import: factors imports config-free helpers
+
+        for sleeve, expected in SLEEVES.items():
+            configured = set(getattr(self, sleeve))
+            unknown = configured - set(expected)
+            if unknown:
+                raise ValueError(
+                    f"factors.{sleeve} has descriptors the pipeline does not compute: "
+                    f"{sorted(unknown)}; valid options are {sorted(expected)}"
+                )
+            if any(w < 0 for w in getattr(self, sleeve).values()):
+                raise ValueError(f"factors.{sleeve} weights must be non-negative")
+            if configured and sum(getattr(self, sleeve).values()) <= 0:
+                raise ValueError(f"factors.{sleeve} weights must not sum to zero")
+        return self
 
 
 class SleeveWeights(BaseModel):
@@ -53,6 +85,21 @@ class WeightingConfig(BaseModel):
     burn_in_months: int = Field(12, ge=0)
     max_sleeve_weight: float = Field(0.50, gt=0.0, le=1.0)
 
+    @model_validator(mode="after")
+    def _cap_is_feasible(self) -> WeightingConfig:
+        # Weights across the three sleeves must sum to 1, so a cap below 1/3
+        # cannot be satisfied. Caught here rather than at runtime, where the
+        # redistribution loop used to give up and renormalize every weight back
+        # above the cap -- silently returning an uncapped blend.
+        n_sleeves = 3
+        if self.max_sleeve_weight * n_sleeves < 1.0 - 1e-9:
+            raise ValueError(
+                f"max_sleeve_weight={self.max_sleeve_weight} is infeasible for {n_sleeves} "
+                f"sleeves ({n_sleeves} x {self.max_sleeve_weight:.4f} < 1); "
+                f"use at least {1 / n_sleeves:.4f}"
+            )
+        return self
+
 
 class HierarchyLevel(BaseModel):
     level: Literal["industry_group", "sector", "cross_sectional"]
@@ -73,11 +120,19 @@ class NormalizationConfig(BaseModel):
 
 
 class QualityGates(BaseModel):
+    # NOTE: `de_min` was removed -- it duplicated the `book_equity > 0` mask that
+    # already NaNs D/E in factors.compute_factors, and nothing read it.
     pe_bounds: tuple[float, float] = (0.0, 500.0)
-    de_min: float = 0.0
     xs_mad_flag: float = Field(10.0, gt=0.0)
     drop_negative_book_bp: bool = True
     drop_negative_ebitda_ev: bool = True
+
+    @model_validator(mode="after")
+    def _pe_bounds_ordered(self) -> QualityGates:
+        lo, hi = self.pe_bounds
+        if not lo < hi:
+            raise ValueError(f"pe_bounds must be (low, high) with low < high, got {self.pe_bounds}")
+        return self
 
 
 class HardFilters(BaseModel):
@@ -94,18 +149,37 @@ class PortfolioConfig(BaseModel):
 
 
 class BacktestConfig(BaseModel):
+    # NOTE: `rebalance` was removed -- it was superseded by
+    # `frequencies_to_test`, which is what `run.py backtest` actually loops over.
     start: str = "2015-01-01"
     end: str = "2024-12-31"
-    rebalance: Literal["monthly", "quarterly"] = "monthly"
     frequencies_to_test: list[Literal["monthly", "quarterly"]] = Field(
         default_factory=lambda: ["monthly", "quarterly"]
     )
 
+    @model_validator(mode="after")
+    def _dates_ordered_and_frequencies_unique(self) -> BacktestConfig:
+        if pd.Timestamp(self.start) >= pd.Timestamp(self.end):
+            raise ValueError(f"backtest.start ({self.start}) must precede end ({self.end})")
+        if not self.frequencies_to_test:
+            raise ValueError("backtest.frequencies_to_test must not be empty")
+        if len(set(self.frequencies_to_test)) != len(self.frequencies_to_test):
+            raise ValueError(
+                f"duplicate entries in frequencies_to_test: {self.frequencies_to_test}"
+            )
+        return self
+
 
 class CostsConfig(BaseModel):
-    commission_bps: float = Field(5.0, ge=0.0)
-    spread_bps: float = Field(10.0, ge=0.0)
-    short_rebate_bps: float = Field(25.0, ge=0.0)
+    # Units are in the names deliberately. commission/spread are per-side costs
+    # charged on each unit of turnover; the short rebate is a borrow rate quoted
+    # PER ANNUM by market convention and accrued over the holding period. Leaving
+    # that unstated is how it came to be charged per rebalance -- 12x too much at
+    # monthly frequency, and the same class of units bug as the months-vs-rows
+    # one in the sleeve-weighting window.
+    commission_bps: float = Field(5.0, ge=0.0)          # per side, per unit traded
+    spread_bps: float = Field(10.0, ge=0.0)             # per side, per unit traded
+    short_rebate_bps_annual: float = Field(25.0, ge=0.0)  # per YEAR, on short notional
 
 
 class OutputConfig(BaseModel):

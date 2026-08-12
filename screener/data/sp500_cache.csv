@@ -39,7 +39,7 @@ APA,APA Corporation,Energy,Oil & Gas Exploration & Production,Energy
 APO,Apollo Global Management,Financials,Asset Management & Custody Banks,Financial Services
 AAPL,Apple Inc.,Information Technology,"Technology Hardware, Storage & Peripherals",Technology Hardware & Equipment
 AMAT,Applied Materials,Information Technology,Semiconductor Materials & Equipment,Semiconductors & Semiconductor Equipment
-APP,AppLovin,Information Technology,Application Software,Software & Services
+APP,AppLovin,Communication Services,Advertising,Media & Entertainment
 APTV,Aptiv,Consumer Discretionary,Automotive Parts & Equipment,Automobiles & Components
 ACGL,Arch Capital Group,Financials,Property & Casualty Insurance,Insurance
 ADM,Archer Daniels Midland,Consumer Staples,Agricultural Products & Services,"Food, Beverage & Tobacco"
@@ -159,14 +159,13 @@ DOW,Dow Inc.,Materials,Commodity Chemicals,Materials
 DHI,D. R. Horton,Consumer Discretionary,Homebuilding,Consumer Durables & Apparel
 DTE,DTE Energy,Utilities,Multi-Utilities,Utilities
 DUK,Duke Energy,Utilities,Electric Utilities,Utilities
-DD,DuPont,Materials,Specialty Chemicals,Materials
+DD,DuPont,Industrials,Industrial Conglomerates,Capital Goods
 ETN,Eaton Corporation,Industrials,Electrical Components & Equipment,Capital Goods
 EBAY,eBay Inc.,Consumer Discretionary,Broadline Retail,Consumer Discretionary Distribution & Retail
 ECHO,EchoStar,Communication Services,Wireless Telecommunication Services,Telecommunication Services
 ECL,Ecolab,Materials,Specialty Chemicals,Materials
 EIX,Edison International,Utilities,Electric Utilities,Utilities
 EW,Edwards Lifesciences,Health Care,Health Care Equipment,Health Care Equipment & Services
-EA,Electronic Arts,Communication Services,Interactive Home Entertainment,Media & Entertainment
 ELV,Elevance Health,Health Care,Managed Health Care,Health Care Equipment & Services
 EME,Emcor,Industrials,Construction & Engineering,Capital Goods
 EMR,Emerson Electric,Industrials,Electrical Components & Equipment,Capital Goods
@@ -195,6 +194,7 @@ FAST,Fastenal,Industrials,Trading Companies & Distributors,Capital Goods
 FRT,Federal Realty Investment Trust,Real Estate,Retail REITs,Equity Real Estate Investment Trusts (REITs)
 FDX,FedEx,Industrials,Air Freight & Logistics,Transportation
 FDXF,FedEx Freight,Industrials,Cargo Ground Transportation,Transportation
+FERG,Ferguson Enterprises,Industrials,Building Products,Capital Goods
 FIS,Fidelity National Information Services,Financials,Transaction & Payment Processing Services,Financial Services
 FITB,Fifth Third Bancorp,Financials,Regional Banks,Banks
 FSLR,First Solar,Information Technology,Semiconductors,Semiconductors & Semiconductor Equipment
@@ -326,7 +326,7 @@ MCO,Moody's Corporation,Financials,Financial Exchanges & Data,Financial Services
 MS,Morgan Stanley,Financials,Investment Banking & Brokerage,Financial Services
 MOS,Mosaic Company (The),Materials,Fertilizers & Agricultural Chemicals,Materials
 MSI,Motorola Solutions,Information Technology,Communications Equipment,Technology Hardware & Equipment
-MSCI,MSCI Inc.,Financials,Financial Exchanges & Data,Financial Services
+MSCI,MSCI,Financials,Financial Exchanges & Data,Financial Services
 NDAQ,"Nasdaq, Inc.",Financials,Financial Exchanges & Data,Financial Services
 NTAP,NetApp,Information Technology,"Technology Hardware, Storage & Peripherals",Technology Hardware & Equipment
 NFLX,Netflix,Communication Services,Movies & Entertainment,Media & Entertainment
@@ -346,7 +346,7 @@ NUE,Nucor,Materials,Steel,Materials
 NVDA,Nvidia,Information Technology,Semiconductors,Semiconductors & Semiconductor Equipment
 NVR,"NVR, Inc.",Consumer Discretionary,Homebuilding,Consumer Durables & Apparel
 NXPI,NXP Semiconductors,Information Technology,Semiconductors,Semiconductors & Semiconductor Equipment
-ORLY,O’Reilly Automotive,Consumer Discretionary,Automotive Retail,Consumer Discretionary Distribution & Retail
+ORLY,O'Reilly Automotive,Consumer Discretionary,Automotive Retail,Consumer Discretionary Distribution & Retail
 OXY,Occidental Petroleum,Energy,Oil & Gas Exploration & Production,Energy
 ODFL,Old Dominion,Industrials,Cargo Ground Transportation,Transportation
 OMC,Omnicom Group,Communication Services,Advertising,Media & Entertainment
@@ -393,7 +393,7 @@ REG,Regency Centers,Real Estate,Retail REITs,Equity Real Estate Investment Trust
 REGN,Regeneron Pharmaceuticals,Health Care,Biotechnology,"Pharmaceuticals, Biotechnology & Life Sciences"
 RF,Regions Financial Corporation,Financials,Regional Banks,Banks
 RSG,Republic Services,Industrials,Environmental & Facilities Services,Commercial & Professional Services
-RMD,ResMed,Health Care,Health Care Equipment,Health Care Equipment & Services
+RMD,ResMed|,Health Care,Health Care Equipment,Health Care Equipment & Services
 RVTY,Revvity,Health Care,Health Care Equipment,Health Care Equipment & Services
 HOOD,Robinhood Markets,Financials,Investment Banking & Brokerage,Financial Services
 ROK,Rockwell Automation,Industrials,Electrical Components & Equipment,Capital Goods

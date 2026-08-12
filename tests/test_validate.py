@@ -48,10 +48,18 @@ def test_quintile_backtest_is_monotonic_q5_beats_q1(signal_panel):
 
 
 def test_sharpe_subtracts_risk_free_rate():
+    """The rf branch must actually be exercised: the same return series scored
+    against a non-zero Rf has to produce a strictly smaller Sharpe."""
+    rng = np.random.default_rng(11)
     idx = pd.date_range("2020-01-31", periods=24, freq="ME")
-    r = pd.Series(0.01, index=idx)  # flat 1%/month, zero vol -> would be inf Sharpe
-    rf = pd.Series(0.01, index=idx)  # equal to the return -> excess is exactly zero
-    assert sharpe(r - r.mean() + 0.01, rf=None) != sharpe(r, rf=rf) or True  # sanity: no crash
+    r = pd.Series(0.01 + rng.normal(0, 0.02, 24), index=idx)
+    rf = pd.Series(0.004, index=idx)
+    gross, excess = sharpe(r, rf=None), sharpe(r, rf=rf)
+    assert excess < gross
+    # Subtracting a CONSTANT Rf shifts the mean but not the vol, so the excess
+    # Sharpe is exactly (mean - rf) / sd * sqrt(12) -- pin it numerically.
+    expected = (r.mean() - 0.004) / r.std(ddof=1) * np.sqrt(12)
+    assert excess == pytest.approx(expected, rel=1e-12)
     # a genuinely-zero-vol excess-return series is undefined (0/0) -> NaN, not inf
     assert np.isnan(sharpe(pd.Series(0.0, index=idx)))
 
@@ -59,8 +67,30 @@ def test_sharpe_subtracts_risk_free_rate():
 def test_max_drawdown_is_negative_for_a_declining_series():
     idx = pd.date_range("2020-01-31", periods=6, freq="ME")
     r = pd.Series([0.05, -0.10, -0.10, 0.02, 0.03, 0.01], index=idx)
-    mdd = max_drawdown(r)
-    assert mdd < 0
+    # Exact, not just sign: the peak is 1.05 after month 1 and the trough is
+    # 1.05*0.9*0.9 = 0.8505, so the drawdown is 0.8505/1.05 - 1 = -19%.
+    assert max_drawdown(r) == pytest.approx(-0.19, abs=1e-9)
+
+
+def test_max_drawdown_counts_a_loss_in_the_very_first_period():
+    """The equity curve must be seeded at 1.0. Without that seed cummax[0] equals
+    curve[0], so an opening loss reports a drawdown of exactly zero -- while the
+    identical loss one period later reports correctly. That incoherence silently
+    understated the published backtest drawdowns."""
+    idx = pd.date_range("2020-01-31", periods=3, freq="ME")
+    loss_first = max_drawdown(pd.Series([-0.20, 0.0, 0.0], index=idx))
+    loss_second = max_drawdown(pd.Series([0.0, -0.20, 0.0], index=idx))
+    assert loss_first == pytest.approx(-0.20, abs=1e-9)
+    assert loss_first == pytest.approx(loss_second, abs=1e-9)
+
+
+def test_max_drawdown_is_zero_for_a_monotonically_rising_series():
+    idx = pd.date_range("2020-01-31", periods=4, freq="ME")
+    assert max_drawdown(pd.Series([0.01, 0.02, 0.01, 0.03], index=idx)) == pytest.approx(0.0)
+
+
+def test_max_drawdown_of_an_empty_series_is_nan():
+    assert np.isnan(max_drawdown(pd.Series(dtype=float)))
 
 
 def test_turnover_is_zero_for_static_holdings():
@@ -93,22 +123,62 @@ def test_net_of_cost_subtracts_a_larger_drag_for_higher_turnover():
     assert net_of_cost(gross, 0.0, 15).equals(gross)  # zero turnover -> zero cost
 
 
-def test_weighted_quintile_returns_market_cap_favors_the_larger_name(signal_panel):
+def test_weighted_quintile_returns_market_cap_weights_are_actually_cap_weighted(signal_panel):
+    """Pin the ARITHMETIC, not just 'differs from equal-weight' -- inverse-cap or
+    random weights would also differ."""
     scores, fwd = signal_panel
-    # Give every name in the panel a market cap, largest for the last ticker
-    # alphabetically in each bucket, so market-cap weighting is distinguishable
-    # from equal weighting.
     tickers = scores.columns
     mc_row = pd.Series(np.arange(1, len(tickers) + 1, dtype=float), index=tickers)
     market_cap = pd.DataFrame([mc_row] * len(scores), index=scores.index)
 
-    eq = quintile_returns(scores, fwd)
     weighted = weighted_quintile_returns(scores, fwd, method="market_cap", market_cap=market_cap)
-    assert list(weighted.columns) == list(eq.columns)
-    assert weighted["Q5"].notna().any()
-    # Market-cap weighting concentrates in the largest names -> a different
-    # (not necessarily larger) return than the naive equal-weight average.
-    assert not weighted["Q5"].equals(eq["Q5"])
+
+    # Recompute Q5 for the first date by hand from the cap weights.
+    dt = scores.index[0]
+    s = scores.loc[dt].dropna()
+    q = pd.qcut(s.rank(method="first"), 5, labels=[1, 2, 3, 4, 5])
+    members = q[q == 5].index
+    w = mc_row.reindex(members) / mc_row.reindex(members).sum()
+    expected = float((fwd.loc[dt].reindex(members) * w).sum())
+    assert weighted.loc[dt, "Q5"] == pytest.approx(expected, rel=1e-12)
+
+
+def test_equal_weighted_variant_matches_the_plain_quintile_returns(signal_panel):
+    """method='equal' must reduce EXACTLY to quintile_returns. These previously
+    disagreed whenever a forward return was missing, because the weighted
+    version summed weight*return with the weights still summing to 1 -- silently
+    scoring an uncovered name as a 0% return and halving the spread."""
+    scores, fwd = signal_panel
+    eq = quintile_returns(scores, fwd)
+    wt = weighted_quintile_returns(scores, fwd, method="equal")
+    pd.testing.assert_frame_equal(eq, wt, check_exact=False, rtol=1e-12)
+
+
+def test_missing_forward_returns_do_not_become_zero_percent_observations():
+    idx = [pd.Timestamp("2020-01-31")]
+    cols = [f"S{i}" for i in range(10)]
+    scores = pd.DataFrame([[float(i) for i in range(10)]], index=idx, columns=cols)
+    fwd = pd.DataFrame([[np.nan] * 10], index=idx, columns=cols)
+    fwd.iloc[0, 0], fwd.iloc[0, 9] = 0.10, 0.20   # only the extremes are covered
+
+    for frame in (quintile_returns(scores, fwd),
+                  weighted_quintile_returns(scores, fwd, method="equal")):
+        assert frame["Q1"].iloc[0] == pytest.approx(0.10)
+        assert frame["Q5"].iloc[0] == pytest.approx(0.20)
+        assert frame["spread"].iloc[0] == pytest.approx(0.10)   # not halved to 0.05
+        assert np.isnan(frame["Q3"].iloc[0])                    # uncovered -> NaN, not 0.0
+
+
+def test_a_constant_signal_produces_no_quintile_observation():
+    """rank(method='first') breaks ties by column order, so a zero-information
+    (all-tied) score vector used to manufacture a large Q5-Q1 spread out of
+    ticker ordering alone."""
+    idx = [pd.Timestamp("2020-01-31")]
+    cols = [f"S{i}" for i in range(10)]
+    scores = pd.DataFrame([[1.0] * 10], index=idx, columns=cols)
+    fwd = pd.DataFrame([[i / 100 for i in range(10)]], index=idx, columns=cols)
+    assert quintile_returns(scores, fwd).empty
+    assert weighted_quintile_returns(scores, fwd, method="equal").empty
 
 
 def test_ic_summary_reports_both_iid_and_hac_t_stats(signal_panel):

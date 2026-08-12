@@ -31,7 +31,7 @@ import pandas as pd
 import requests
 
 from .base import DataProvider
-from .cache import Cache
+from .cache import Cache, version_hash
 from .yf import YFinanceProvider
 
 _TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
@@ -74,7 +74,14 @@ class EdgarProvider(DataProvider):
     def __init__(self, contact_email: str = "adilip407@gmail.com", cache_dir: str = ".cache",
                  min_interval: float = 0.12) -> None:
         self.headers = {"User-Agent": f"equity-screener research {contact_email}"}
-        self.cache = Cache(cache_dir)
+        # Version the cache on the XBRL tag maps: the cached frame is the OUTPUT
+        # of extraction, so editing a tag map must invalidate it. Otherwise the
+        # stale frame is returned verbatim, the extractor never re-runs, and any
+        # column added later silently comes back all-NaN.
+        self.cache = Cache(
+            cache_dir,
+            version=f"edgar_{version_hash(_FLOW, _STOCK, _DEI_SHARES_TAGS)}",
+        )
         self.min_interval = min_interval
         self._last = 0.0
         self._cik: dict[str, str] | None = None
@@ -212,11 +219,23 @@ class EdgarProvider(DataProvider):
         return df.drop(columns=derived)
 
     def get_fundamentals(self, tickers: list[str]) -> pd.DataFrame:
+        """Point-in-time fundamentals for ``tickers``.
+
+        Every reason a name is dropped is counted and reported. Silently
+        skipping HTTP failures made a throttled pull indistinguishable from a
+        complete one: SEC returns 403/429 under fair-access limits, so a run
+        that recovered a tenth of the universe still produced a well-formed
+        frame and called itself "the S&P 500 factor screen".
+        """
         cikmap = self._cik_map()
         frames = []
+        no_cik: list[str] = []
+        http_failed: list[str] = []
+        no_facts: list[str] = []
         for t in tickers:
             cik = cikmap.get(t)
             if cik is None:
+                no_cik.append(t)          # not an SEC filer (often post-acquisition)
                 continue
             key = f"edgar_fund_{t}"
             cached = self.cache.get(key)
@@ -225,13 +244,32 @@ class EdgarProvider(DataProvider):
                 continue
             try:
                 facts = self._get(_FACTS_URL.format(cik=cik))
-            except requests.HTTPError:
+            except requests.HTTPError as e:
+                http_failed.append(f"{t} ({getattr(e.response, 'status_code', '?')})")
                 continue
             df = self._facts_to_frame(t, facts)
             if df.empty:
+                no_facts.append(t)
                 continue
             self.cache.put(key, df)
             frames.append(df)
+
+        n = len(tickers)
+        for label, dropped in (("no SEC CIK", no_cik), ("HTTP error", http_failed),
+                               ("no usable XBRL facts", no_facts)):
+            if dropped:
+                print(f"[edgar] {len(dropped)}/{n} dropped - {label}: "
+                      f"{', '.join(dropped[:8])}{' ...' if len(dropped) > 8 else ''}")
+        if http_failed:
+            # Distinguish "this company has no data" (a fact about the world)
+            # from "we failed to fetch it" (a fact about this run).
+            print(f"[edgar] WARNING: {len(http_failed)} ticker(s) failed to download and are "
+                  "MISSING from this run, not genuinely absent - re-run to retry.")
+        if frames:
+            # One decimal, not zero: 501/503 rounds to "100%" at :.0f, which
+            # reads as full coverage when two names are actually missing.
+            print(f"[edgar] fundamentals recovered for {len(frames)}/{n} tickers "
+                  f"({100 * len(frames) / n:.1f}% coverage)")
         if not frames:
             return pd.DataFrame()
         return pd.concat(frames, ignore_index=True).sort_values(["ticker", "period_end"])

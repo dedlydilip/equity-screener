@@ -24,6 +24,7 @@ not point-in-time either — see universe.py).
 from __future__ import annotations
 
 import io
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -40,32 +41,59 @@ def _normalize_ticker_col(s: pd.Series) -> pd.Series:
     return s.astype("string").str.replace(".", "-", regex=False).str.strip()
 
 
+def _parse_changes(html: str) -> pd.DataFrame:
+    """Parse the 'changes to the list' table. Separate from the fetch so a
+    layout change is distinguishable from a network failure."""
+    raw = pd.read_html(io.StringIO(html))[1]
+    if raw.shape[1] != 6:
+        raise ValueError(
+            f"Wikipedia changes table has {raw.shape[1]} columns, expected 6 "
+            "(date, added ticker/security, removed ticker/security, reason) - "
+            "the positional column assignment below would silently mislabel them."
+        )
+    raw.columns = ["date", "added_ticker", "added_security",
+                   "removed_ticker", "removed_security", "reason"]
+    parsed = pd.to_datetime(raw["date"], format="%B %d, %Y", errors="coerce")
+    unparseable = int(parsed.isna().sum())
+    if unparseable:
+        # Dropping these silently means those membership changes are never
+        # undone, so every reconstructed historical universe quietly retains
+        # names that had actually left the index.
+        print(f"[pit_membership] WARNING: {unparseable}/{len(raw)} change rows have an "
+              "unparseable date and are excluded; reconstructed historical membership "
+              "will be incomplete for the affected dates.")
+    return pd.DataFrame({
+        "date": parsed,
+        "added_ticker": _normalize_ticker_col(raw["added_ticker"]),
+        "removed_ticker": _normalize_ticker_col(raw["removed_ticker"]),
+    }).dropna(subset=["date"])
+
+
 def get_sp500_changes(use_cache: bool = True) -> pd.DataFrame:
     """Tidy changes table: columns ``date, added_ticker, removed_ticker``,
-    one row per effective-date change event, sorted ascending by date."""
+    one row per effective-date change event, sorted ascending by date.
+
+    As in :func:`screener.universe.get_sp500`, a fallback to the committed CSV
+    is announced and does not rewrite the cache.
+    """
     df: pd.DataFrame | None = None
+    from_cache = False
     try:
         resp = requests.get(WIKI_URL, headers=_HEADERS, timeout=30)
         resp.raise_for_status()
-        raw = pd.read_html(io.StringIO(resp.text))[1]
-        raw.columns = ["date", "added_ticker", "added_security",
-                       "removed_ticker", "removed_security", "reason"]
-        df = pd.DataFrame({
-            "date": pd.to_datetime(raw["date"], format="%B %d, %Y", errors="coerce"),
-            "added_ticker": _normalize_ticker_col(raw["added_ticker"]),
-            "removed_ticker": _normalize_ticker_col(raw["removed_ticker"]),
-        }).dropna(subset=["date"])
-    except Exception:
+        df = _parse_changes(resp.text)
+    except Exception as e:  # noqa: BLE001 - network OR parse; both fall back
         if use_cache and _CACHE.exists():
+            age_days = (time.time() - _CACHE.stat().st_mtime) / 86400
+            print(f"[pit_membership] live fetch failed ({type(e).__name__}: {e}); "
+                  f"using the cached changes table, {age_days:.0f} days old.")
             df = pd.read_csv(_CACHE, parse_dates=["date"])
+            from_cache = True
         else:
             raise
 
-    if use_cache:
-        try:
-            df.to_csv(_CACHE, index=False)
-        except Exception:
-            pass
+    if use_cache and not from_cache:
+        df.to_csv(_CACHE, index=False)
     return df.sort_values("date").reset_index(drop=True)
 
 

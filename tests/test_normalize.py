@@ -133,3 +133,59 @@ def test_cap_and_redistribute_enforces_max_weight():
     assert out["value"] == pytest.approx(0.5, abs=1e-6)
     assert out.sum() == pytest.approx(1.0, abs=1e-9)
     assert out["quality"] > 0.15  # received redistributed excess
+
+
+def test_an_infeasible_cap_raises_instead_of_silently_exceeding_itself():
+    """cap * n < 1 cannot be satisfied by weights that sum to 1. This used to
+    break out of the redistribution loop and then renormalize every weight back
+    ABOVE the cap -- returning an uncapped blend that looked capped."""
+    w = pd.Series({"value": 0.5, "quality": 0.3, "momentum": 0.2})
+    with pytest.raises(ValueError, match="infeasible"):
+        _cap_and_redistribute(w, cap=0.30)   # 3 x 0.30 = 0.90 < 1
+
+
+def test_a_feasible_cap_at_exactly_one_over_n_is_allowed():
+    w = pd.Series({"value": 0.5, "quality": 0.3, "momentum": 0.2})
+    out = _cap_and_redistribute(w, cap=1 / 3)
+    assert out.max() == pytest.approx(1 / 3, abs=1e-9)
+
+
+def test_a_zero_volatility_sleeve_gets_the_most_weight_not_the_average():
+    """Zero measured risk is the STRONGEST inverse-vol signal. Substituting the
+    mean inverse-vol previously ranked a zero-vol sleeve BELOW a measured
+    higher-volatility one -- the exact inverse of the intent."""
+    n = 30
+    rng = np.random.default_rng(3)
+    sleeves = pd.DataFrame({
+        "value": rng.normal(0, 0.017, n),
+        "quality": np.zeros(n),                 # zero realized volatility
+        "momentum": rng.normal(0, 0.038, n),
+    })
+    w = inverse_vol_weights(sleeves, lookback=12, max_weight=0.9, burn_in=12, as_of_row=20)
+    assert w["quality"] > w["value"] > w["momentum"]
+    assert sum(w.values()) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_an_empty_lookback_window_falls_back_to_equal_weights_not_nan():
+    """burn_in=0 at row 0 leaves nothing to measure. Emitting NaN weights here
+    propagated through composite() and voided the entire cross-section."""
+    sleeves = pd.DataFrame(np.random.default_rng(0).normal(0, 0.02, size=(6, 3)),
+                           columns=["value", "quality", "momentum"])
+    w = inverse_vol_weights(sleeves, lookback=4, max_weight=0.5, burn_in=0, as_of_row=0)
+    assert all(np.isfinite(v) for v in w.values())
+    assert all(v == pytest.approx(1 / 3) for v in w.values())
+
+
+def test_inverse_vol_window_excludes_the_current_row():
+    """The window must end at as_of_row EXCLUSIVE -- using the current row's own
+    realized sleeve return to set that row's weight is look-ahead."""
+    n = 20
+    sleeves = pd.DataFrame({
+        "value": [0.001] * n, "quality": [0.002] * n, "momentum": [0.003] * n,
+    })
+    # Make row 15 a wild outlier. If it were included in the window for
+    # as_of_row=15, the measured vols (and therefore weights) would change.
+    sleeves.loc[15] = [10.0, 20.0, 30.0]
+    before = inverse_vol_weights(sleeves, lookback=12, max_weight=0.9, burn_in=5, as_of_row=15)
+    after = inverse_vol_weights(sleeves, lookback=12, max_weight=0.9, burn_in=5, as_of_row=16)
+    assert before != after   # row 15 only affects the weights from row 16 onward
